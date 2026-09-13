@@ -8,10 +8,13 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "huggingface-hub>=0.30",
     "ipython>=8",
     "numpy>=2",
     "peft>=0.20.0",
+    "plotly>=5",
     "python-dotenv>=1",
+    "safetensors>=0.5",
     "tabulate>=0.9",
     "torch>=2.13",
     "tqdm>=4.66",
@@ -22,3 +25,8 @@ dependencies = [
 [build-system]
 requires = ["uv_build>=0.12.10,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
