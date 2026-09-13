@@ -1,0 +1,24 @@
+[project]
+name = "mechtools"
+version = "0.1.0"
+description = "Shared helpers for mechinterp research projects"
+readme = "README.md"
+authors = [
+    { name = "Ethan Hadley", email = "ekhadley@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "ipython>=8",
+    "numpy>=2",
+    "peft>=0.20.0",
+    "python-dotenv>=1",
+    "tabulate>=0.9",
+    "torch>=2.13",
+    "tqdm>=4.66",
+    "transformer-lens>=3.8",
+    "transformers>=5.16",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
