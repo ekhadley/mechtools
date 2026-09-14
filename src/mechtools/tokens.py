@@ -16,16 +16,16 @@ def to_ids(inp: str | Tensor | list[int] | list[dict], tokenizer, **chat_kwargs)
 def to_str_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, **chat_kwargs) -> list[str]:
     return [tokenizer.decode(tok) for tok in to_ids(inp, tokenizer, **chat_kwargs)]
 
-TOKS_CSS = "<style>.tk span:hover{outline:1px solid #e66}</style>"
+TOKS_CSS = "<style>.tk{cursor:default} .tk span:hover{outline:1px solid #e66}</style>"
 
 def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | None = None, lo: int = 0, hi: int | None = None) -> str:
-    """strs[lo:hi] as spans with alternating backgrounds, the one at pos underlined, hover showing index (and id if given). Put it inside a dark monospace container."""
+    """strs[lo:hi] as spans with alternating backgrounds, the one at pos underlined, hover showing index, id (if given) and repr of the string. Put it inside a dark monospace container."""
     pos, hi = (pos % len(strs) if pos is not None else None), (len(strs) if hi is None else hi)
-    spans = "".join(f"<span title='{i}{f' &middot; id {ids[i]}' if ids else ''}' style='background:{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i == pos else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
+    spans = "".join(f"<span title='{i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}' style='background:{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i == pos else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
     return f"{TOKS_CSS}<div class='tk' style='white-space:pre-wrap;line-height:1.8'>{'… ' if lo > 0 else ''}{spans}{' …' if hi < len(strs) else ''}</div>"
 
 def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
-    """Rich HTML display of a prompt's tokens, hover shows index and token id, the token at pos (if given) underlined.
+    """Rich HTML display of a prompt's tokens, hover shows index, token id and repr, the token at pos (if given) underlined.
     A conversation (list of role/content dicts) goes through apply_chat_template; the chat kwargs and any template_kwargs (e.g. enable_thinking=False for Qwen3) are forwarded to it."""
     ids = to_ids(inp, tokenizer, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message, tools=tools, chat_template=chat_template, **template_kwargs)
     display(HTML(f"<div style='background:#111;color:#ddd;font:12px monospace;padding:8px'>{toks_html([tokenizer.decode(i) for i in ids], ids, pos)}</div>"))

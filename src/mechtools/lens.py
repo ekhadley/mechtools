@@ -9,7 +9,7 @@ from safetensors import safe_open
 
 from mechtools.stats import kmeans
 from mechtools.tables import show_table
-from mechtools.tokens import to_str_toks, toks_html
+from mechtools.tokens import to_ids, toks_html
 
 LENS_REPO = "camilablank/workspace-lenses"
 
@@ -72,29 +72,30 @@ def fmt3(x: float) -> str:
 def cluster_color(c: int) -> str:
     return f"hsl({c * 0.618 % 1 * 360:.0f},70%,65%)"
 
-def get_str_toks(input_src, tokenizer=None) -> list[str] | None:
-    """The str tokens of a readout's input_src: None or a list of str tokens as is; a string, ids (tensor or list), or a conversation is tokenized, which needs tokenizer."""
+def get_toks(input_src, tokenizer=None) -> tuple[list[str] | None, list[int] | None]:
+    """(str tokens, ids) of a readout's input_src: None or a list of str tokens as is (ids None); a string, ids (tensor or list), or a conversation is tokenized, which needs tokenizer."""
     if input_src is None or (isinstance(input_src, list) and isinstance(input_src[0], str)):
-        return input_src
+        return input_src, None
     assert tokenizer is not None, "input_src needs tokenizing, pass tokenizer"
-    return to_str_toks(input_src, tokenizer)
+    ids = to_ids(input_src, tokenizer)
+    return [tokenizer.decode(i) for i in ids], ids
 
 def per_pos(fn, pos: int | list[int]):
     """fn(pos) for an int, {p: fn(p)} over a list of positions."""
     return fn(pos) if isinstance(pos, int) else {p: fn(p) for p in pos}
 
-def token_strip(toks: list[str], pos: int = -1, ctx: int = 32) -> str:
-    """The tokens up to `ctx` either side of `pos`, alternating backgrounds, the one at `pos` underlined."""
+def token_strip(toks: list[str], ids: list[int] | None = None, pos: int = -1, ctx: int = 32) -> str:
+    """The tokens up to `ctx` either side of `pos`, alternating backgrounds, the one at `pos` underlined, hover showing index, id (if given) and repr."""
     pos = pos % len(toks)
-    return f"<div style='margin:0 0 8px;color:#ddd'>{toks_html(toks, None, pos, max(0, pos - ctx), min(len(toks), pos + ctx + 1))}</div>"
+    return f"<div style='margin:0 0 8px;color:#ddd'>{toks_html(toks, ids, pos, max(0, pos - ctx), min(len(toks), pos + ctx + 1))}</div>"
 
 def readout_grid(tables: list[tuple[str, list[tuple[list[str], str | None]]]]) -> str:
     """Grid of small tables. `tables` is [(header html, [(cell htmls, row color or None), ...]), ...]. Cells are raw html, so escape names first."""
     return "<div class='ro'>" + "".join(f"<table><tr><th colspan={len(rows[0][0])}>{header}</th></tr>" + "".join(f"<tr{f' style=color:{color}' if color else ''}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>" for cells, color in rows) + "</table>" for header, rows in tables) + "</div>"
 
-def readout_html(body: str, title: str | None = None, toks: list[str] | None = None, pos: int = -1, ctx: int = 32, n_cols: int = 4) -> str:
+def readout_html(body: str, title: str | None = None, toks: list[str] | None = None, ids: list[int] | None = None, pos: int = -1, ctx: int = 32, n_cols: int = 4) -> str:
     """Dark monospace frame around `body` (a readout_grid, or tabbed grids) with an optional title and token strip above it."""
-    heading = (f"<h3 style='margin:0 0 8px'>{title}</h3>" if title else "") + (token_strip(toks, pos, ctx) if toks is not None else "")
+    heading = (f"<h3 style='margin:0 0 8px'>{title}</h3>" if title else "") + (token_strip(toks, ids, pos, ctx) if toks is not None else "")
     return f"{READOUT_CSS.format(n_cols=n_cols)}<div style='background:#111;color:#eee;font:12px monospace;padding:8px'>{heading}{body}</div>"
 
 def tabbed(panes: dict[str, str] | dict[str, dict[str, str]]) -> str:
@@ -109,14 +110,14 @@ def tabbed(panes: dict[str, str] | dict[str, dict[str, str]]) -> str:
 
 def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = True, title: str | None = None, input_src=None, pos: int = -1, ctx: int = 32, n_cols: int = 4, tokenizer=None):
     """One table per entry of `scores` ({header: [n] logits or scores}) listing its top-k items. softmax=True shows probs, else raw scores.
-    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_str_toks) shows the tokens up to ctx either side of pos, the one at pos underlined."""
+    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of pos, the one at pos underlined."""
     name = names.__getitem__ if isinstance(names, list) else names
     tables = []
     for header, s in scores.items():
         vals = s.flatten().float()
         top = (vals.softmax(-1) if softmax else vals).topk(k)
         tables.append((html.escape(header), [([html.escape(repr(name(i))), fmt3(v)], None) for i, v in zip(top.indices.tolist(), top.values.tolist())]))
-    display(HTML(readout_html(readout_grid(tables), title, get_str_toks(input_src, tokenizer), pos, ctx, n_cols)))
+    display(HTML(readout_html(readout_grid(tables), title, *get_toks(input_src, tokenizer), pos, ctx, n_cols)))
 
 def jlens_readout(cache, layers, pos: int, model, jlens: dict, k: int = 10, hook: str = "hook_resid_pre", input_src=None, title: str = "j-lens readout", ctx: int = 32, n_cols: int = 4):
     """j-lens token readout at `pos` for each layer in `layers`, from a run_with_cache cache of a single prompt."""
@@ -127,6 +128,15 @@ def tlens_readout(cache, layers, pos: int, tlens: dict, k: int = 10, hook: str =
     """Template-lens cosine readout at `pos` for each layer in `layers`, from a run_with_cache cache of a single prompt."""
     scores = {f"L{layer}": get_tlens_scores(cache[f"blocks.{layer}.{hook}"][0, pos], layer, tlens) for layer in layers}
     top_readout(scores, tlens["words"], k, False, title, input_src, pos, ctx, n_cols, tokenizer)
+
+def vocab_vecs(model, embed: bool = False) -> Tensor:
+    """Mean-centered float token vectors [vocab, d]: the rows of W_U.T, or of W_E when embed=True."""
+    x = (model.W_E if embed else model.W_U.T).float()
+    return x - x.mean(0)
+
+def cluster_vocab(model, k: int = 1024, iters: int = 150, seed: int = 0, embed: bool = False) -> tuple[Tensor, Tensor]:
+    """Spherical k-means over vocab_vecs(model, embed). Returns (labels [vocab], centroids [k, d]), for jlens_cluster_readout and plot_vocab_umap."""
+    return kmeans(vocab_vecs(model, embed), k, iters, seed)
 
 def cluster_tlens(tlens: dict, layer: int, k: int = 256, iters: int = 50, seed: int = 0, device: str = "cuda") -> tuple[Tensor, Tensor]:
     """Spherical k-means over one layer's mean-centered template vectors. Returns (labels [n_templates], centroids [k, d])."""
@@ -156,9 +166,9 @@ def cluster_readout(scores: dict[str, Tensor] | dict[str, dict[int, Tensor]], la
     """Tabbed grids, one per entry of `scores`: {tab: [n] logits or scores}, all at sequence position `pos`, or {tab: {pos: scores}} for a second bar of position tabs below the first (left/right arrows switch tab, up/down switch position).
     Each grid: the overall top-k with each item's cluster id, then one table per top cluster with each item's overall rank. Items are colored by cluster.
     labels is [n] cluster ids shared by all tabs, or {tab: labels} when the clustering differs per tab. softmax=True: scores are logits, cells show probs, clusters ranked by prob mass. softmax=False: cells show raw scores (e.g. cosines), clusters ranked by max score.
-    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_str_toks) shows the tokens up to ctx either side of the position under the bars, that token underlined. Returns the shown cluster ids, keyed like scores."""
+    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of the position under the bars, that token underlined. Returns the shown cluster ids, keyed like scores."""
     name = names.__getitem__ if isinstance(names, list) else names
-    toks = get_str_toks(input_src, tokenizer)
+    toks, ids = get_toks(input_src, tokenizer)
     nested = isinstance(next(iter(scores.values())), dict)
     panes, shown = {}, {}
     for label, s in scores.items():
@@ -166,7 +176,7 @@ def cluster_readout(scores: dict[str, Tensor] | dict[str, dict[int, Tensor]], la
         panes[label], shown[label] = {}, {}
         for p, sp in (s if nested else {pos: s}).items():
             tables, shown[label][p] = cluster_tables(sp, lab, name, n_clusters, n_rows, softmax)
-            panes[label][f"p{p}"] = (token_strip(toks, p, ctx) if toks is not None else "") + readout_grid(tables)
+            panes[label][f"p{p}"] = (token_strip(toks, ids, p, ctx) if toks is not None else "") + readout_grid(tables)
     display(HTML(readout_html(tabbed(panes), title, n_cols=n_cols)))
     return shown if nested else {label: v[pos] for label, v in shown.items()}
 

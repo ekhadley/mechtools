@@ -4,6 +4,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import torch as t
+import umap
 from plotly.subplots import make_subplots
 from torch import Tensor
 
@@ -468,3 +469,16 @@ def hist(
         for series in (arr if isinstance(arr, list) else [arr]):
             fig.add_vline(x=series.mean(), line_width=3, line_dash="dash", line_color="black", annotation_text=f"Mean = {series.mean():.3f}", annotation_position="top")
     return fig if return_fig else fig.show(renderer=renderer, config={"staticPlot": static})
+
+def plot_vocab_umap(x: Tensor, labels: Tensor, tokenizer, n_points: int = 20_000, pca_dim: int = 128, seed: int = 0):
+    """UMAP of a random subset of token vectors x [vocab, d], colored by cluster, hover shows token and cluster id."""
+    idx = t.randperm(len(x), generator=t.Generator().manual_seed(seed))[:n_points]
+    sub = x[idx].float()
+    sub = (sub @ t.pca_lowrank(sub, q=pca_dim)[2]).cpu().numpy()
+    emb = umap.UMAP(metric="cosine", random_state=seed).fit_transform(sub)
+    lab = labels[idx].cpu().numpy()
+    hover = [f"{tokenizer.decode([i])!r}<br>cluster {c}" for i, c in zip(idx.tolist(), lab.tolist())]
+    fig = go.Figure(go.Scattergl(x=emb[:, 0], y=emb[:, 1], mode="markers", text=hover, hoverinfo="text",
+                                 marker=dict(size=3, color=(lab * 0.618) % 1, colorscale="Phase", showscale=False)))
+    fig.update_layout(title=f"UMAP of {n_points} token vectors, {labels.max().item() + 1} clusters", width=1000, height=800, margin=dict(l=10, r=10, t=40, b=10))
+    fig.show()
