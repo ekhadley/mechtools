@@ -22,13 +22,13 @@ import httpx
 import plotly.graph_objects as go
 
 from mechtools.colors import *
-from mechtools.openrouter import RequestFailed, _usd, complete, endpoints, gather_bar
+from mechtools.openrouter import RequestFailed, _usd, complete, endpoints, flat, gather_bar
 from mechtools.stats import wilson
 from mechtools.tables import show_table
 
 class Resampler:
     """Resamples text (a CoT, or a reasoning-off response) from token position t: the provider continues prompt + the first t tokens of text through raw /completions, so prompt must be the rendered chat template ending inside the open think or text block, and provider must pass raw prompts through verbatim: run probe first, and read the module docstring for the rest of the checklist. Each rollout checks prompt_tokens == n_prompt + t and raises otherwise.
-    Rollouts append to the jsonl at path, one per line: t, i, reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, plus whatever judge(rollout) returns. response is the continuation only; when text is a response, the judge sees the whole thing as prefix(t) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them.
+    Rollouts append to the jsonl at path, one per line: t, i, reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, raw (the response bodies, one per call), plus whatever judge(rollout) returns. response is the continuation only; when text is a response, the judge sees the whole thing as prefix(t) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them.
     A provider that returns reasoning and response merged (Together) needs stop at the end-of-reasoning token and response_open, the string that opens the response block: each rollout is then two calls. kw goes to complete: max_tokens (covering reasoning plus response), temperature, top_p and top_k (pass them explicitly), timeout, ...
     Which positions to sample and how many is up to the caller: fill({t: count}) tops up the deficit at each position, so a strided grid is one call and an adaptive scheme is a loop over fill and scores."""
 
@@ -52,15 +52,17 @@ class Resampler:
     async def rollout(self, t: int, i: int, client: httpx.AsyncClient | None = None) -> dict:
         """One continuation from position t, judged, appended to the file and to self.rollouts. With response_open the response is sampled in a second call after the reasoning stops, and stays empty when the reasoning hit max_tokens."""
         prefix = self.prompt + (self.prefix(t) or "")
-        r = await complete(prefix, self.model, self.provider, stop=self.stop, client=client, **self.kw)
+        body = await complete(prefix, self.model, self.provider, stop=self.stop, client=client, **self.kw)
+        r = flat(body)
         if r["prompt_tokens"] != self.n_prompt + t:
             raise RuntimeError(f"t={t}: {r['provider']} counted {r['prompt_tokens']} prompt tokens, expected {self.n_prompt + t}: it wrapped or re-tokenized the prefix")
-        rec = {"t": t, "i": i, "reasoning": r["reasoning"], "response": r["text"], "finish_reason": r["finish_reason"], "provider": r["provider"], "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"], "cost": r["cost"]}
+        rec = {"t": t, "i": i, "reasoning": r["reasoning"], "response": r["text"], "finish_reason": r["finish_reason"], "provider": r["provider"], "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"], "cost": r["cost"], "raw": [body]}
         if self.response_open:
             rec |= {"reasoning": r["text"], "response": ""}
             if r["finish_reason"] == "stop":
-                r2 = await complete(prefix + r["text"] + self.response_open, self.model, self.provider, stop=self.stop, client=client, **self.kw)
-                rec |= {"response": r2["text"], "finish_reason": r2["finish_reason"], "completion_tokens": rec["completion_tokens"] + r2["completion_tokens"], "cost": rec["cost"] + r2["cost"]}
+                body2 = await complete(prefix + r["text"] + self.response_open, self.model, self.provider, stop=self.stop, client=client, **self.kw)
+                r2 = flat(body2)
+                rec |= {"response": r2["text"], "finish_reason": r2["finish_reason"], "completion_tokens": rec["completion_tokens"] + r2["completion_tokens"], "cost": rec["cost"] + r2["cost"], "raw": [body, body2]}
         if self.judge:
             rec |= await self.judge(rec)
         with open(self.path, "a") as f:
@@ -102,17 +104,17 @@ async def _probe_one(tok, model: str, ep: dict, strings: list[str], samples: int
     n = lambda s: len(tok(s or "", add_special_tokens=False)["input_ids"])
     row = {"provider": ep["provider"], "quant": ep.get("quantization"), "$/M in,out": f"{float(ep['pricing']['prompt']) * 1e6:.2f}, {float(ep['pricing']['completion']) * 1e6:.2f}"}
     try:
-        rs = [await complete(s, model, ep["provider"], max_tokens=1, attempts=4, client=client) for s in strings]
+        rs = [flat(await complete(s, model, ep["provider"], max_tokens=1, attempts=4, client=client)) for s in strings]
         row["offsets"] = [r["prompt_tokens"] - n(s) for r, s in zip(rs, strings)]
         if any(row["offsets"]):
             row["verdict"] = ("wrapped" + (" + system prompt" if min(row["offsets"]) > 40 else "")) if max(row["offsets"]) - min(row["offsets"]) <= 2 else "re-tokenized"
             return row
-        rs = await asyncio.gather(*[complete(strings[1], model, ep["provider"], max_tokens=12, attempts=4, client=client) for _ in range(samples)])
+        rs = [flat(b) for b in await asyncio.gather(*[complete(strings[1], model, ep["provider"], max_tokens=12, attempts=4, client=client) for _ in range(samples)])]
         conts = [(r["reasoning"] or "") + (r["text"] or "") for r in rs]
         row["continues"] = f"{sum(c.lstrip().startswith('391') for c in conts)}/{samples}"
         row["field"] = "+".join(k for k in ("reasoning", "text") if any(r[k] for r in rs))
         row["sample"] = next((c for c in conts if not c.lstrip().startswith("391")), conts[0])[:40]
-        r = await complete(strings[0], model, ep["provider"], max_tokens=long, attempts=4, client=client)
+        r = flat(await complete(strings[0], model, ep["provider"], max_tokens=long, attempts=4, client=client))
         row |= {"finish": r["finish_reason"], "special": [s for s in tok.all_special_tokens if s in (r["reasoning"] or "") + (r["text"] or "")], "extra_toks": r["completion_tokens"] - n(r["reasoning"]) - n(r["text"]), "reasoning_toks": f"{r['reasoning_tokens']} vs {n(r['reasoning'])} local"}
         row["verdict"] = ("pass" if row["continues"] == f"{samples}/{samples}" else "restarts") + ("" if "reasoning" in row["field"] else ", merged: needs stop + response_open")
     except RequestFailed as e:
@@ -139,8 +141,8 @@ async def sampling_defaults(model: str, provider: str, prompt: str, n: int = 500
     counts = {}
     async with httpx.AsyncClient(limits=httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)) as client:
         for name, kw in {"omitted": {}, "explicit": {"top_p": 1.0, "top_k": 0}}.items():
-            rs = await gather_bar([complete(prompt, model, provider, max_tokens=1, client=client, **kw) for _ in range(n)], concurrency, name)
-            counts[name] = Counter((r["reasoning"] or r["text"] or "") for r in rs if r)
+            rs = [flat(b) for b in await gather_bar([complete(prompt, model, provider, max_tokens=1, client=client, **kw) for _ in range(n)], concurrency, name) if b]
+            counts[name] = Counter((r["reasoning"] or r["text"] or "") for r in rs)
             print(f"  {name}: {len(counts[name])} distinct tokens in {sum(counts[name].values())} draws; top {counts[name].most_common(5)}, tail {counts[name].most_common()[-5:]}")
     return counts
 

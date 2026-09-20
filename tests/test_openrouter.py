@@ -31,7 +31,7 @@ def test_payloads(monkeypatch):
         seen.append((path, payload))
         return CHAT_BODY
     monkeypatch.setattr(orr, "_post", fake_post)
-    asyncio.run(chat("hi", "m", provider="deepinfra", reasoning=True, top_k=0))
+    assert asyncio.run(chat("hi", "m", provider="deepinfra", reasoning=True, top_k=0)) is CHAT_BODY
     asyncio.run(chat([{"role": "user", "content": "hi"}], "m", reasoning="high"))
     asyncio.run(complete("<think>", "m", provider="chutes", stop="</think>"))
     assert seen[0] == ("/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8192, "temperature": 1.0, "transforms": [], "usage": {"include": True}, "top_k": 0, "provider": {"only": ["deepinfra"], "allow_fallbacks": False}, "reasoning": {"enabled": True}})

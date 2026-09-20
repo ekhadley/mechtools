@@ -94,10 +94,9 @@ async def _post(client: httpx.AsyncClient, path: str, payload: dict, attempts: i
     raise RequestFailed(why, detail)
 
 
-async def _request(path: str, payload: dict, attempts: int, timeout: float, raw: bool, client: httpx.AsyncClient | None) -> dict:
+async def _request(path: str, payload: dict, attempts: int, timeout: float, client: httpx.AsyncClient | None) -> dict:
     async with (contextlib.nullcontext(client) if client else httpx.AsyncClient()) as c:
-        body = await _post(c, path, payload, attempts, timeout)
-    return body if raw else flat(body)
+        return await _post(c, path, payload, attempts, timeout)
 
 
 def _usd(x: float) -> str:
@@ -109,26 +108,26 @@ def _pin(provider: str | dict) -> dict:
 
 
 async def chat(conv: str | list[dict], model: str, provider: str | dict | None = None, reasoning: bool | str | dict | None = None, max_tokens: int = 8192, temperature: float = 1.0,
-               attempts: int = 6, timeout: float = 600, raw: bool = False, client: httpx.AsyncClient | None = None, **body) -> dict:
-    """One /chat/completions call: the flat record (see flat), or the response body with raw=True. A str conv is a single user turn. provider pins one endpoint by slug (a dict passes through as OpenRouter's provider object).
+               attempts: int = 6, timeout: float = 600, client: httpx.AsyncClient | None = None, **body) -> dict:
+    """One /chat/completions call: the response body as OpenRouter sent it (store that; flat pulls the common fields). A str conv is a single user turn. provider pins one endpoint by slug (a dict passes through as OpenRouter's provider object).
     reasoning True/False sets enabled, a str sets effort, a dict passes through. body passes through: top_p, top_k, seed, stop, logprobs, response_format, ..."""
     payload = {"model": model, "messages": [{"role": "user", "content": conv}] if isinstance(conv, str) else conv, "max_tokens": max_tokens, "temperature": temperature, "transforms": [], "usage": {"include": True}, **body}
     if provider: payload["provider"] = _pin(provider)
     if reasoning is not None: payload["reasoning"] = {"enabled": reasoning} if isinstance(reasoning, bool) else {"effort": reasoning} if isinstance(reasoning, str) else reasoning
-    return await _request("/chat/completions", payload, attempts, timeout, raw, client)
+    return await _request("/chat/completions", payload, attempts, timeout, client)
 
 
 async def complete(prompt: str, model: str, provider: str | dict | None = None, max_tokens: int = 8192, temperature: float = 1.0, stop: str | list[str] | None = None,
-                   attempts: int = 6, timeout: float = 600, raw: bool = False, client: httpx.AsyncClient | None = None, **body) -> dict:
-    """One raw /completions call on a self-rendered prompt string, e.g. a chat template ending inside an open think block. transforms=[] keeps OpenRouter from compressing the prompt; whether the provider passes it through verbatim shows in prompt_tokens."""
+                   attempts: int = 6, timeout: float = 600, client: httpx.AsyncClient | None = None, **body) -> dict:
+    """One raw /completions call on a self-rendered prompt string, returning the response body, e.g. a chat template ending inside an open think block. transforms=[] keeps OpenRouter from compressing the prompt; whether the provider passes it through verbatim shows in prompt_tokens."""
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature, "transforms": [], "usage": {"include": True}, **body}
     if provider: payload["provider"] = _pin(provider)
     if stop: payload["stop"] = [stop] if isinstance(stop, str) else stop
-    return await _request("/completions", payload, attempts, timeout, raw, client)
+    return await _request("/completions", payload, attempts, timeout, client)
 
 
 def flat(body: dict) -> dict:
-    """The record a project stores, from either endpoint's body: text (message content, or the raw completion), reasoning, finish_reason, provider, model, prompt_tokens, completion_tokens, reasoning_tokens (wrong on many providers; count from text), cost (dollars)."""
+    """The common fields of either endpoint's body: text (message content, or the raw completion), reasoning, finish_reason, provider, model, prompt_tokens, completion_tokens, reasoning_tokens (wrong on many providers; count from text), cost (dollars). Store the body itself; it has more (reasoning_details with signatures, native_finish_reason, refusal, cache and cost breakdowns, the generation id)."""
     choice, usage = body["choices"][0], body["usage"]
     msg = choice.get("message")  # chat bodies; a raw completion carries text and reasoning on the choice itself
     return {"text": msg["content"] if msg else choice["text"], "reasoning": (msg or choice).get("reasoning"), "finish_reason": choice.get("finish_reason"), "provider": body["provider"], "model": body["model"],
