@@ -10,7 +10,9 @@ from mechtools.colors import *
 from mechtools.hooks import *
 from mechtools.lens import *
 from mechtools.models import *
+from mechtools.openrouter import *
 from mechtools.plots import *
+from mechtools.resample import *
 from mechtools.sampling import *
 from mechtools.stats import *
 from mechtools.tables import *

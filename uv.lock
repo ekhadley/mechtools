@@ -950,6 +950,7 @@ name = "mechtools"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "ipython" },
     { name = "numpy" },
@@ -973,6 +974,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=0.30" },
     { name = "ipython", specifier = ">=8" },
     { name = "numpy", specifier = ">=2" },
