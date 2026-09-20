@@ -136,14 +136,16 @@ def flat(body: dict) -> dict:
 
 async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow: tuple[type[Exception], ...] = (RequestFailed,)) -> list:
     """Awaits coros at most concurrency at a time under a progress bar; results in order. A coro that raises one of swallow yields None, counted by cause with the first of each kind printed above the bar; any other exception cancels the rest and propagates.
-    The status line: coroutines ok/fail, dollars so far, open requests and the age of the oldest (slow models show here, not as errors), mean seconds per successful request, requests sleeping in backoff, finish reasons other than stop (length = truncated), failed attempts by cause (429, 503, timeout, envelope 429, finish error, ...). tqdm clips it to the terminal width; the summary printed at the end has everything."""
+    The status line: coroutines ok/fail, dollars spent < the projected total for the whole run (mean cost per finished coroutine, failures included, times len(coros)), open requests and the age of the oldest (slow models show here, not as errors), mean seconds per successful request, requests sleeping in backoff, finish reasons other than stop (length = truncated), failed attempts by cause (429, 503, timeout, envelope 429, finish error, ...). tqdm clips it to the terminal width; the summary printed at the end has everything."""
     global _stats
     _stats = s = Stats()
     sem, fails, n_ok, t0 = asyncio.Semaphore(concurrency), Counter(), 0, time.monotonic()
     bar = tqdm(total=len(coros), desc=f"{cyan}{desc}{endc}", bar_format="{desc} {bar:15} {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {unit}", ascii=" >=", dynamic_ncols=True)
 
     def status() -> str:
-        parts = [f"{green}ok {n_ok}{endc}" + (f" {red}fail {sum(fails.values())}{endc}" if fails else ""), f"{cyan}{_usd(s.cost)}{endc}"]
+        done = n_ok + sum(fails.values())
+        cost = _usd(s.cost) + (f"<{_usd(s.cost * len(coros) / done)}" if done and s.cost else "")  # spent so far < the run's projected total, scaled by the fraction of coroutines done
+        parts = [f"{green}ok {n_ok}{endc}" + (f" {red}fail {sum(fails.values())}{endc}" if fails else ""), f"{cyan}{cost}{endc}"]
         if s.open: parts.append(f"open {len(s.open)} oldest {time.monotonic() - min(s.open.values()):.0f}s")
         if s.ok: parts.append(f"{s.latency / s.ok:.0f}s/req")
         if s.sleeping: parts.append(f"{yellow}backoff {s.sleeping}{endc}")
