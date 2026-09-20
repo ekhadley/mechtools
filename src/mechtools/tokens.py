@@ -16,12 +16,13 @@ def to_ids(inp: str | Tensor | list[int] | list[dict], tokenizer, **chat_kwargs)
 def to_str_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, **chat_kwargs) -> list[str]:
     return [tokenizer.decode(tok) for tok in to_ids(inp, tokenizer, **chat_kwargs)]
 
-TOKS_CSS = "<style>.tk{cursor:default} .tk span:hover{outline:1px solid #e66}</style>"
+TOKS_CSS = "<style>.tk{cursor:default} .tk span:hover{outline:1px solid #e66} .tk span[data-p]{cursor:pointer;border-bottom:2px solid #666} .tk span[data-p].on{border-bottom-color:#e66;background:#503a3a !important}</style>"
 
-def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | None = None, lo: int = 0, hi: int | None = None) -> str:
-    """strs[lo:hi] as spans with alternating backgrounds, the one at pos underlined, hover showing index, id (if given) and repr of the string. Put it inside a dark monospace container."""
-    pos, hi = (pos % len(strs) if pos is not None else None), (len(strs) if hi is None else hi)
-    spans = "".join(f"<span title='{i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}' style='background:{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i == pos else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
+def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | list[int] | None = None, lo: int = 0, hi: int | None = None) -> str:
+    """strs[lo:hi] as spans with alternating backgrounds, hover showing index, id (if given) and repr of the string. An int `pos` underlines that token; a list of positions marks each one as a clickable tab target (data-p is its index in the list; the enclosing widget gives the selected one class 'on'). Put it inside a dark monospace container."""
+    hi, sel = (len(strs) if hi is None else hi), [p % len(strs) for p in ([] if pos is None else [pos] if isinstance(pos, int) else pos)]
+    tabs = {p: j for j, p in enumerate(sel)} if isinstance(pos, list) else {}
+    spans = "".join(f"<span {f'data-p={tabs[i]} ' if i in tabs else ''}title='{i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}' style='background:{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i in sel and not tabs else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
     return f"{TOKS_CSS}<div class='tk' style='white-space:pre-wrap;line-height:1.8'>{'… ' if lo > 0 else ''}{spans}{' …' if hi < len(strs) else ''}</div>"
 
 def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):

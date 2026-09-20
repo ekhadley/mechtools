@@ -63,7 +63,7 @@ def top_templates_table(scores: Tensor, words: list[str], k: int = 10, title: st
 
 # ============================= HTML readouts ============================= #
 
-READOUT_CSS = "<style>.ro{{display:grid;grid-template-columns:repeat({n_cols},1fr);gap:8px}} .ro table{{border-collapse:collapse;align-self:start}} .ro th{{background:#2a3f5f;text-align:left;padding:3px 6px;font-weight:normal}} .ro td{{padding:1px 6px;white-space:nowrap;text-align:left}} .ro td:last-child{{text-align:right;color:#eee}} .tb{{margin:0 0 8px}} .tb button{{background:#222;color:#aaa;border:1px solid #444;padding:2px 8px;font:inherit;cursor:pointer}} .tb button.on{{background:#2a3f5f;color:#fff}}</style>"
+READOUT_CSS = "<style>.ro{{display:grid;grid-template-columns:repeat({n_cols},1fr);gap:8px}} .ro table{{border-collapse:collapse;align-self:start}} .ro th{{background:#2a3f5f;text-align:left;padding:3px 6px;font-weight:normal}} .ro td{{padding:1px 6px;white-space:nowrap;text-align:left}} .ro td:last-child{{text-align:right;color:#eee}} .tb{{margin:0 0 8px}} .tb button{{background:#222;color:#aaa;border:1px solid #444;padding:2px 8px;font:inherit;cursor:pointer}} .tb button.on{{background:#2a3f5f;color:#fff}} .pn{{display:grid}} .pane{{grid-area:1/1;visibility:hidden}} .pane.on{{visibility:visible}}</style>"
 
 def fmt3(x: float) -> str:
     """3 sig figs: fixed point down to 1e-4, scientific below that."""
@@ -84,10 +84,11 @@ def per_pos(fn, pos: int | list[int]):
     """fn(pos) for an int, {p: fn(p)} over a list of positions."""
     return fn(pos) if isinstance(pos, int) else {p: fn(p) for p in pos}
 
-def token_strip(toks: list[str], ids: list[int] | None = None, pos: int = -1, ctx: int = 32) -> str:
-    """The tokens up to `ctx` either side of `pos`, alternating backgrounds, the one at `pos` underlined, hover showing index, id (if given) and repr."""
-    pos = pos % len(toks)
-    return f"<div style='margin:0 0 8px;color:#ddd'>{toks_html(toks, ids, pos, max(0, pos - ctx), min(len(toks), pos + ctx + 1))}</div>"
+def token_strip(toks: list[str], ids: list[int] | None = None, pos: int | list[int] = -1, ctx: int = 32) -> str:
+    """The tokens up to `ctx` either side of the position(s), alternating backgrounds, hover showing index, id (if given) and repr.
+    An int underlines that token; a list of positions marks each one, clickable as the position tabs of the enclosing `tabbed` widget."""
+    ps = [p % len(toks) for p in ([pos] if isinstance(pos, int) else pos)]
+    return f"<div style='margin:0 0 8px;color:#ddd'>{toks_html(toks, ids, ps[0] if isinstance(pos, int) else ps, max(0, min(ps) - ctx), min(len(toks), max(ps) + ctx + 1))}</div>"
 
 def readout_grid(tables: list[tuple[str, list[tuple[list[str], str | None]]]]) -> str:
     """Grid of small tables. `tables` is [(header html, [(cell htmls, row color or None), ...]), ...]. Cells are raw html, so escape names first."""
@@ -98,15 +99,16 @@ def readout_html(body: str, title: str | None = None, toks: list[str] | None = N
     heading = (f"<h3 style='margin:0 0 8px'>{title}</h3>" if title else "") + (token_strip(toks, ids, pos, ctx) if toks is not None else "")
     return f"{READOUT_CSS.format(n_cols=n_cols)}<div style='background:#111;color:#eee;font:12px monospace;padding:8px'>{heading}{body}</div>"
 
-def tabbed(panes: dict[str, str] | dict[str, dict[str, str]]) -> str:
+def tabbed(panes: dict[str, str] | dict[str, dict[str, str]], head: str = "") -> str:
     """A bar of tabs over the panes, one shown at a time, or two bars when the panes are nested dicts (every outer key having the same inner keys). A bar with a single tab is not shown.
-    Click a tab, or click anywhere in the widget and use the left/right (first bar) and up/down (second bar) arrow keys."""
+    Click a tab, or click anywhere in the widget and use the left/right (first bar) and up/down (second bar) arrow keys. `head` is html above the bars; any element in it with a data-p attribute is a clickable tab of the second bar and carries class 'on' while selected.
+    The panes are stacked in one grid cell, so the widget keeps the height of its tallest pane and does not resize as tabs change."""
     uid = secrets.token_hex(4)
     rows = {k: v if isinstance(v, dict) else {"": v} for k, v in panes.items()}
     bars = "".join(f"<div class='tb'{' hidden' if len(ls) == 1 else ''}>{''.join(f'<button>{l}</button>' for l in ls)}</div>" for ls in [list(rows), list(next(iter(rows.values())))])
-    divs = "".join(f"<div class='pane' data-k='{i},{j}'>{p}</div>" for i, row in enumerate(rows.values()) for j, p in enumerate(row.values()))
-    js = f"const r=document.getElementById('{uid}'),bars=[...r.querySelectorAll('.tb')],panes=[...r.querySelectorAll('.pane')],cur=[0,0];const show=()=>{{bars.forEach((bar,l)=>[...bar.children].forEach((x,j)=>x.classList.toggle('on',j==cur[l])));panes.forEach(x=>x.hidden=x.dataset.k!=cur.join(','))}};bars.forEach((bar,l)=>[...bar.children].forEach((x,j)=>x.onclick=()=>{{cur[l]=j;show()}}));const K={{ArrowLeft:[0,-1],ArrowRight:[0,1],ArrowUp:[1,-1],ArrowDown:[1,1]}};r.onkeydown=e=>{{const m=K[e.key];if(m){{const n=bars[m[0]].children.length;cur[m[0]]=(cur[m[0]]+m[1]+n)%n;show();e.preventDefault();e.stopPropagation()}}}};show()"
-    return f"<div id='{uid}' tabindex=0 style='outline:none'>{bars}{divs}</div><script>(()=>{{{js}}})()</script>"
+    divs = "<div class='pn'>" + "".join(f"<div class='pane' data-k='{i},{j}'>{p}</div>" for i, row in enumerate(rows.values()) for j, p in enumerate(row.values())) + "</div>"
+    js = f"const r=document.getElementById('{uid}'),bars=[...r.querySelectorAll('.tb')],panes=[...r.querySelectorAll('.pane')],marks=[...r.querySelectorAll('[data-p]')],cur=[0,0];const show=()=>{{bars.forEach((bar,l)=>[...bar.children].forEach((x,j)=>x.classList.toggle('on',j==cur[l])));panes.forEach(x=>x.classList.toggle('on',x.dataset.k==cur.join(',')));marks.forEach(x=>x.classList.toggle('on',x.dataset.p==cur[1]))}};bars.forEach((bar,l)=>[...bar.children].forEach((x,j)=>x.onclick=()=>{{cur[l]=j;show()}}));marks.forEach(x=>x.onclick=()=>{{cur[1]=+x.dataset.p;show()}});const K={{ArrowLeft:[0,-1],ArrowRight:[0,1],ArrowUp:[1,-1],ArrowDown:[1,1]}};r.onkeydown=e=>{{const m=K[e.key];if(m){{const n=bars[m[0]].children.length;cur[m[0]]=(cur[m[0]]+m[1]+n)%n;show();e.preventDefault();e.stopPropagation()}}}};show()"
+    return f"<div id='{uid}' tabindex=0 style='outline:none'>{head}{bars}{divs}</div><script>(()=>{{{js}}})()</script>"
 
 def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = True, title: str | None = None, input_src=None, pos: int = -1, ctx: int = 32, n_cols: int = 4, tokenizer=None):
     """One table per entry of `scores` ({header: [n] logits or scores}) listing its top-k items. softmax=True shows probs, else raw scores.
@@ -166,18 +168,20 @@ def cluster_readout(scores: dict[str, Tensor] | dict[str, dict[int, Tensor]], la
     """Tabbed grids, one per entry of `scores`: {tab: [n] logits or scores}, all at sequence position `pos`, or {tab: {pos: scores}} for a second bar of position tabs below the first (left/right arrows switch tab, up/down switch position).
     Each grid: the overall top-k with each item's cluster id, then one table per top cluster with each item's overall rank. Items are colored by cluster.
     labels is [n] cluster ids shared by all tabs, or {tab: labels} when the clustering differs per tab. softmax=True: scores are logits, cells show probs, clusters ranked by prob mass. softmax=False: cells show raw scores (e.g. cosines), clusters ranked by max score.
-    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of the position under the bars, that token underlined. Returns the shown cluster ids, keyed like scores."""
+    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows a token strip above the bars, spanning ctx tokens either side of the positions read out; those tokens are marked and clicking one switches to its position. Returns the shown cluster ids, keyed like scores."""
     name = names.__getitem__ if isinstance(names, list) else names
     toks, ids = get_toks(input_src, tokenizer)
     nested = isinstance(next(iter(scores.values())), dict)
+    positions = list(next(iter(scores.values()))) if nested else [pos]
     panes, shown = {}, {}
     for label, s in scores.items():
         lab = labels[label] if isinstance(labels, dict) else labels
         panes[label], shown[label] = {}, {}
         for p, sp in (s if nested else {pos: s}).items():
             tables, shown[label][p] = cluster_tables(sp, lab, name, n_clusters, n_rows, softmax)
-            panes[label][f"p{p}"] = (token_strip(toks, ids, p, ctx) if toks is not None else "") + readout_grid(tables)
-    display(HTML(readout_html(tabbed(panes), title, n_cols=n_cols)))
+            panes[label][f"p{p}"] = readout_grid(tables)
+    strip = token_strip(toks, ids, positions, ctx) if toks is not None else ""
+    display(HTML(readout_html(tabbed(panes, strip), title, n_cols=n_cols)))
     return shown if nested else {label: v[pos] for label, v in shown.items()}
 
 def jlens_cluster_readout(cache, layers, pos: int | list[int], model, jlens: dict, labels: Tensor, n_clusters: int = 11, n_rows: int = 10, hook: str = "hook_resid_pre", input_src=None, title: str = "j-lens cluster readout", ctx: int = 32, n_cols: int = 4) -> dict:

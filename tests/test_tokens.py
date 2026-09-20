@@ -40,9 +40,11 @@ def test_to_ids_input_kinds(tok):
 
 def test_toks_html():
     h = toks_html(["a<b", "\n", "c"], [1, 2, 3], pos=-1)
-    assert "a&lt;b" in h and "↵" in h and h.count("border-bottom") == 1 and "id 3 &middot; &#x27;c&#x27;" in h
+    assert "a&lt;b" in h and "↵" in h and h.count("border-bottom:2px solid #e66") == 1 and "id 3 &middot; &#x27;c&#x27;" in h
     h = toks_html(list("abcdefg"), lo=2, hi=5)
     assert h.count("<span") == 3 and "… " in h and " …" in h
+    h = toks_html(list("abcdefg"), pos=[3, -1])
+    assert h.count("<span data-p=") == 2 and "<span data-p=0 title='3" in h and "<span data-p=1 title='6" in h and "border-bottom:2px solid #e66" not in h
 
 def test_turn_tok_idx(tok):
     ids = to_ids(CONV, tok)
