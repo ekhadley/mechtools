@@ -38,6 +38,15 @@ def test_payloads(monkeypatch):
     assert seen[1][1]["reasoning"] == {"effort": "high"} and "provider" not in seen[1][1]
     assert seen[2] == ("/completions", {"model": "m", "prompt": "<think>", "max_tokens": 8192, "temperature": 1.0, "transforms": [], "usage": {"include": True}, "provider": {"only": ["chutes"], "allow_fallbacks": False}, "stop": ["</think>"]})
 
+def test_missing_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("OTHER=1\n")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(RuntimeError, match=f"OPENROUTER_API_KEY is not set: {tmp_path / '.env'} was loaded"):
+        endpoints("m")
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY is not set"):
+        asyncio.run(complete("x", "m"))
+
 def test_gather_bar():
     async def ok(i):
         await asyncio.sleep(0.01 * (3 - i))  # finish out of order

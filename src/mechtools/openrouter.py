@@ -1,4 +1,4 @@
-"""OpenRouter sampling: async chat and raw-completions requests with retries, a bounded gather under an informative progress bar, and the endpoints serving a model."""
+"""OpenRouter sampling: async chat and raw-completions requests with retries, a bounded gather under an informative progress bar, and the endpoints serving a model. Needs OPENROUTER_API_KEY, which importing mechtools loads from the first .env found walking up from the cwd."""
 
 import asyncio
 import contextlib
@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 import httpx
+from dotenv import find_dotenv
 from tqdm import tqdm
 
 from mechtools.colors import *
@@ -55,9 +56,17 @@ def _verdict(status: int, body: dict, text: str) -> tuple[str | None, str]:
     raise RequestFailed(str(status), detail)
 
 
+def _key() -> str:
+    """The OpenRouter key, or a RuntimeError that says which .env was loaded. Importing mechtools loads the first .env found walking up from the cwd, so run from the project directory."""
+    if "OPENROUTER_API_KEY" not in os.environ:
+        found = find_dotenv(usecwd=True)
+        raise RuntimeError(f"OPENROUTER_API_KEY is not set: {f'{found} was loaded when mechtools was imported and does not set it' if found else f'no .env found walking up from {os.getcwd()}'}. Put it in the project's .env and run from the project directory.")
+    return os.environ["OPENROUTER_API_KEY"]
+
+
 async def _post(client: httpx.AsyncClient, path: str, payload: dict, attempts: int, timeout: float) -> dict:
     """POST payload to path and return the body. Retries with doubling backoff (1, 3, 7, ... s) on network errors, timeouts, 408/429/5xx, a 200 with no choices, and finish_reason "error"; the first failure of each kind is printed."""
-    s, rid, headers = _stats, id(payload), {"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}
+    s, rid, headers = _stats, id(payload), {"Authorization": f"Bearer {_key()}"}
     for attempt in range(attempts):
         if attempt:
             s.sleeping += 1
@@ -192,6 +201,6 @@ async def complete_batch(prompts: list[str], model: str, concurrency: int = 32, 
 
 def endpoints(model: str) -> list[dict]:
     """The endpoints serving model, each with the slug to pin under "provider" plus the API's fields: tag, quantization, context_length, max_completion_tokens, pricing, supported_parameters, ..."""
-    r = httpx.get(f"{OPENROUTER_URL}/models/{model}/endpoints", headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"}, timeout=30)
+    r = httpx.get(f"{OPENROUTER_URL}/models/{model}/endpoints", headers={"Authorization": f"Bearer {_key()}"}, timeout=30)
     r.raise_for_status()
     return [{"provider": e["tag"].split("/")[0], **e} for e in r.json()["data"]["endpoints"]]

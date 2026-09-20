@@ -9,7 +9,7 @@ Shared prelude for the mechinterp research projects in `~/wgmn`. See README.md f
 
 ## API runs
 
-- `OPENROUTER_API_KEY` comes from the project's `.env` through `load_dotenv()` at import. This repo has no `.env`: a live check from here loads a project's (`load_dotenv("/home/ek/wgmn/weirdchat/.env")` in a scratch script). Never print the key.
+- `OPENROUTER_API_KEY` comes from the first `.env` found walking up from the cwd when mechtools is imported: the project's when run from its directory. This repo has no `.env`, so from here the walk continues to `~/wgmn` and `~`. A missing key raises a `RuntimeError` naming the file it looked at. Never print the key.
 - Live calls cost money. The tests use fakes; keep any live check to a few requests with small `max_tokens`, and report the spend.
 - Batch helpers go through `gather_bar`, whose status line separates slow from throttled, counts failed attempts by cause, and shows dollars. A coroutine that exhausts its retries yields `None` and a rerun fills the deficit; auth and credit errors stop the batch.
 - CoT resampling: run `mechtools.resample.probe` on the model's endpoints before any paid run, and read the `mechtools.resample` module docstring, which is the checklist of what to verify, what each failure looks like, and the pitfalls. The measurements behind it (weirdchat, 2026-09) are in `docs/openrouter_provider_findings.md`; rosters change, so probe rather than trust the file.

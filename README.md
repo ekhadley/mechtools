@@ -10,7 +10,7 @@ Per project, from that project's directory:
 uv add --editable ~/wgmn/mechtools
 ```
 
-Then `from mechtools import *` at the top of a script gives the whole prelude: color constants, `tec`, `set_seed`, `pbar` (tqdm with colored desc, `ncols=120`, ascii fill), and everything below. Importing also turns on IPython autoreload when in a kernel and calls `load_dotenv()`, which is how `openrouter` gets `OPENROUTER_API_KEY`: put it in the project's `.env`.
+Then `from mechtools import *` at the top of a script gives the whole prelude: color constants, `tec`, `set_seed`, `pbar` (tqdm with colored desc, `ncols=120`, ascii fill), and everything below. Importing also turns on IPython autoreload when in a kernel and loads the first `.env` found walking up from the current directory, the project's when run from the project directory; that is where `OPENROUTER_API_KEY` goes, and a missing key raises a `RuntimeError` that names the file it looked at.
 
 ## Tests
 
