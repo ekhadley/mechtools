@@ -1,3 +1,5 @@
+import re
+
 from mechtools.lens import tabbed, token_strip
 
 TOKS = [f"t{i}" for i in range(20)]
@@ -14,3 +16,20 @@ def test_tabbed_stacks_panes_and_wires_head():
     assert h.count("class='pane'") == 4 and h.count("class='pn'") == 1
     assert h.index("data-p=0") < h.index("class='tb'")  # head goes above the tab bars
     assert "marks.forEach(x=>x.onclick" in h and "x.classList.toggle('on',x.dataset.k==cur.join(','))" in h
+
+def test_show_logits_marks_every_position_and_the_actual_next_token(monkeypatch):
+    import torch as t
+    from mechtools import lens
+    out = []
+    monkeypatch.setattr(lens, "display", lambda x: out.append(x.data))
+    tok = type("T", (), {"decode": lambda self, i: f"<{int(i)}>"})()
+    logits = t.zeros(3, 8)
+    logits[0, 1] = 9.0  # pos 0 predicts the actual next id, 1
+    logits[1] = t.tensor([9., 8., 7., 6., 0., 5., 4., 3.])  # pos 1's actual next id, 4, is ranked last
+    lens.show_logits([3, 1, 4], logits=logits, tokenizer=tok, k=3)
+    h = out[0]
+    assert h.count("class='pane'") == 3 and h.count("data-p=") == 3 and h.count("class='tb' hidden") == 2  # a pane and a clickable token per position, no tab bars
+    p0, p1, p2 = re.findall(r"<table>.*?</table>", h)
+    assert p0.count("<tr") == 4 and p0.count("color:#e88") == 1 and "#1</span></td><td>&#x27;&lt;1&gt;" in p0  # actual next token colored in place at rank 1
+    assert p1.count("<tr") == 5 and p1.split("<tr")[-1].count("#8") == 1 and "&lt;4&gt;" in p1.split("<tr")[-1]  # outside the top-k, appended with its rank
+    assert p2.count("color:#e88") == 0  # last position has no next token

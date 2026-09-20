@@ -99,16 +99,16 @@ def readout_html(body: str, title: str | None = None, toks: list[str] | None = N
     heading = (f"<h3 style='margin:0 0 8px'>{title}</h3>" if title else "") + (token_strip(toks, ids, pos, ctx) if toks is not None else "")
     return f"{READOUT_CSS.format(n_cols=n_cols)}<div style='background:#111;color:#eee;font:12px monospace;padding:8px'>{heading}{body}</div>"
 
-def tabbed(panes: dict[str, str] | dict[str, dict[str, str]], head: str = "") -> str:
-    """A bar of tabs over the panes, one shown at a time, or two bars when the panes are nested dicts (every outer key having the same inner keys). A bar with a single tab is not shown.
+def tabbed(panes: dict[str, str] | dict[str, dict[str, str]], head: str = "", bars: bool = True) -> str:
+    """A bar of tabs over the panes, one shown at a time, or two bars when the panes are nested dicts (every outer key having the same inner keys). A bar with a single tab is not shown, and bars=False hides both bars, leaving the tabs in `head` and the arrow keys as the only way to switch.
     Click a tab, or click anywhere in the widget and use the left/right (first bar) and up/down (second bar) arrow keys. `head` is html above the bars; any element in it with a data-p attribute is a clickable tab of the second bar and carries class 'on' while selected.
     The panes are stacked in one grid cell, so the widget keeps the height of its tallest pane and does not resize as tabs change."""
     uid = secrets.token_hex(4)
     rows = {k: v if isinstance(v, dict) else {"": v} for k, v in panes.items()}
-    bars = "".join(f"<div class='tb'{' hidden' if len(ls) == 1 else ''}>{''.join(f'<button>{l}</button>' for l in ls)}</div>" for ls in [list(rows), list(next(iter(rows.values())))])
+    tab_bars = "".join(f"<div class='tb'{' hidden' if len(ls) == 1 or not bars else ''}>{''.join(f'<button>{l}</button>' for l in ls)}</div>" for ls in [list(rows), list(next(iter(rows.values())))])
     divs = "<div class='pn'>" + "".join(f"<div class='pane' data-k='{i},{j}'>{p}</div>" for i, row in enumerate(rows.values()) for j, p in enumerate(row.values())) + "</div>"
     js = f"const r=document.getElementById('{uid}'),bars=[...r.querySelectorAll('.tb')],panes=[...r.querySelectorAll('.pane')],marks=[...r.querySelectorAll('[data-p]')],cur=[0,0];const show=()=>{{bars.forEach((bar,l)=>[...bar.children].forEach((x,j)=>x.classList.toggle('on',j==cur[l])));panes.forEach(x=>x.classList.toggle('on',x.dataset.k==cur.join(',')));marks.forEach(x=>x.classList.toggle('on',x.dataset.p==cur[1]))}};bars.forEach((bar,l)=>[...bar.children].forEach((x,j)=>x.onclick=()=>{{cur[l]=j;show()}}));marks.forEach(x=>x.onclick=()=>{{cur[1]=+x.dataset.p;show()}});const K={{ArrowLeft:[0,-1],ArrowRight:[0,1],ArrowUp:[1,-1],ArrowDown:[1,1]}};r.onkeydown=e=>{{const m=K[e.key];if(m){{const n=bars[m[0]].children.length;cur[m[0]]=(cur[m[0]]+m[1]+n)%n;show();e.preventDefault();e.stopPropagation()}}}};show()"
-    return f"<div id='{uid}' tabindex=0 style='outline:none'>{head}{bars}{divs}</div><script>(()=>{{{js}}})()</script>"
+    return f"<div id='{uid}' tabindex=0 style='outline:none'>{head}{tab_bars}{divs}</div><script>(()=>{{{js}}})()</script>"
 
 def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = True, title: str | None = None, input_src=None, pos: int = -1, ctx: int = 32, n_cols: int = 4, tokenizer=None):
     """One table per entry of `scores` ({header: [n] logits or scores}) listing its top-k items. softmax=True shows probs, else raw scores.
@@ -120,6 +120,32 @@ def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = T
         top = (vals.softmax(-1) if softmax else vals).topk(k)
         tables.append((html.escape(header), [([html.escape(repr(name(i))), fmt3(v)], None) for i, v in zip(top.indices.tolist(), top.values.tolist())]))
     display(HTML(readout_html(readout_grid(tables), title, *get_toks(input_src, tokenizer), pos, ctx, n_cols)))
+
+NEXT_COLOR = "#e88"
+
+def show_logits(input_src, model=None, logits=None, tokenizer=None, k: int = 10, pos: list[int] | None = None, title: str | None = "logits", ctx: int = 32, n_cols: int = 4):
+    """Top-k next-token table for one position of the input at a time: click a token in the strip above (or use the up/down arrows) to see what the model predicts after it.
+    Pass `model` to run it on the input, or `logits` [seq, vocab] (or [1, seq, vocab]) from your own forward pass. The row of the input's actual next token is colored, and appended below the top-k when it is not in it.
+    input_src (see get_toks) is a string, ids, a conversation, or str tokens; `pos` restricts the readout to those positions, all of them by default."""
+    assert (model is None) != (logits is None), "pass either model or logits"
+    tokenizer = tokenizer if tokenizer is not None else model.tokenizer
+    toks, ids = get_toks(input_src, tokenizer)
+    if logits is None:
+        logits = model(t.tensor(ids)[None])
+    logits = logits.squeeze(0) if logits.ndim == 3 else logits
+    positions = list(range(len(toks))) if pos is None else [p % len(toks) for p in pos]
+    panes = {}
+    for p in positions:
+        probs = logits[p].float().softmax(-1)
+        top = probs.topk(k)
+        nxt = ids[p + 1] if ids is not None and p + 1 < len(ids) else None
+        row = lambda rank, i, prob: ([f"<span style='color:#999'>#{rank}</span>", html.escape(repr(tokenizer.decode(i))), fmt3(prob)], NEXT_COLOR if i == nxt else None)
+        rows = [row(rank, i, prob) for rank, (i, prob) in enumerate(zip(top.indices.tolist(), top.values.tolist()), 1)]
+        if nxt is not None and nxt not in top.indices:
+            rows.append(row((probs > probs[nxt]).sum().item() + 1, nxt, probs[nxt].item()))
+        panes[f"p{p}"] = readout_grid([(f"p{p} &middot; {html.escape(repr(toks[p]))} &rarr;", rows)])
+    body = tabbed({"": panes}, token_strip(toks, ids, positions, ctx), bars=False)
+    display(HTML(readout_html(body, title, n_cols=n_cols)))
 
 def jlens_readout(cache, layers, pos: int, model, jlens: dict, k: int = 10, hook: str = "hook_resid_pre", input_src=None, title: str = "j-lens readout", ctx: int = 32, n_cols: int = 4):
     """j-lens token readout at `pos` for each layer in `layers`, from a run_with_cache cache of a single prompt."""
