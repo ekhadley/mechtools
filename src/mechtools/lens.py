@@ -15,15 +15,15 @@ LENS_REPO = "camilablank/workspace-lenses"
 
 # ============================= loading and scoring ============================= #
 
-def load_jlens(path: str, device: str = "cpu") -> dict:
+def load_jlens(path: str, device: str | t.device = "cpu") -> dict:
     """A j-lens .pt from the workspace-lenses repo: {"J": [n_layers, d_model, d_model], "provenance": ...}."""
     return t.load(hf_hub_download(repo_id=LENS_REPO, filename=path), map_location=device, weights_only=False)
 
-def load_tlens(path: str, device: str = "cpu") -> dict:
+def load_tlens(path: str, device: str | t.device = "cpu") -> dict:
     """A template lens safetensors from the workspace-lenses repo plus its row -> text map: {"meta", "templates": [n_layers, n_templates, d_model], "word_ids", "words"}."""
     local_path = hf_hub_download(repo_id=LENS_REPO, filename=path)
     words_path = hf_hub_download(repo_id=LENS_REPO, filename=path.replace("templates", "template_words").replace(".safetensors", ".txt"))
-    with safe_open(local_path, framework="pt", device=device) as f:
+    with safe_open(local_path, framework="pt", device=str(device)) as f:
         tlens = {"meta": f.metadata(), "templates": f.get_tensor("templates"), "word_ids": f.get_tensor("word_ids")}
     tlens["words"] = [line.split("\t", 1)[1] for line in open(words_path).read().splitlines()]
     return tlens

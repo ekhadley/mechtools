@@ -13,3 +13,7 @@ Shared prelude for the mechinterp research projects in `~/wgmn`. See README.md f
 - Live calls cost money. The tests use fakes; keep any live check to a few requests with small `max_tokens`, and report the spend.
 - Batch helpers go through `gather_bar`, whose status line separates slow from throttled, counts failed attempts by cause, and shows dollars. A coroutine that exhausts its retries yields `None` and a rerun fills the deficit; auth and credit errors stop the batch.
 - CoT resampling: run `mechtools.resample.probe` on the model's endpoints before any paid run, and read the `mechtools.resample` module docstring, which is the checklist of what to verify, what each failure looks like, and the pitfalls. The measurements behind it (weirdchat, 2026-09) are in `docs/openrouter_provider_findings.md`; rosters change, so probe rather than trust the file.
+
+## Todo
+
+- The advanced readout functions (`show_logits`, `jlens_readout`, `tlens_readout`, and the other `top_readout` callers) should return a packaged object holding both the rendered visualization and the underlying computed data, instead of only displaying. That object would carry `save_html` for sharing a readout outside the notebook, methods to turn the same data into plots of various forms, and plain attribute access to the scores/tokens that were computed.
