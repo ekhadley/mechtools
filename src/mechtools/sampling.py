@@ -24,7 +24,7 @@ def stream_toks_hf(model, tokenizer, toks: Tensor, new_toks: int = 512):
             break
         yield toks.item()
 
-def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512) -> list[list[int]]:
+def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:bool = False) -> list[list[int]]:
     """n independent temperature-1 samples from one prompt [1, seq], generated as a batch; each row is returned cut before its first eos."""
     eos = model.tokenizer.eos_token_id
     toks = prompt_toks.repeat(n, 1)
@@ -32,7 +32,8 @@ def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512) -> lis
     gen = t.zeros(n, 0, dtype=t.long, device=prompt_toks.device)
     alive = t.ones(n, dtype=t.bool, device=prompt_toks.device)
     lengths = t.full((n,), new_toks, device=prompt_toks.device)
-    for step in tqdm(range(new_toks), desc="sampling", ascii=" >="):
+    iterator = range(new_toks) if quiet else tqdm(range(new_toks), desc="sampling", ascii=" >=")
+    for step in iterator:
         logits, past = model(toks, return_type="logits_and_cache", past_key_values=past, use_cache=True)
         toks = t.multinomial(t.softmax(logits[:, -1].float(), dim=-1), num_samples=1)
         gen = t.cat([gen, toks], dim=1)
