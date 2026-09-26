@@ -7,11 +7,16 @@ Shared prelude for the mechinterp research projects in `~/wgmn`. See README.md f
 - SAE helpers (`load_sae`, `save_sae`, `top_feats_summary`, `get_sae_pre_acts`, `get_latent_dec`, neuronpedia dashboard links): `subliminal_learning/utils.py`, `anonymous_subliminal/utils.py`, `ao/utils.py` (load/save/top_feats), `sae_lora/utils.py` (`get_sae_pre_acts`, `top_feats_summary`), `introspect/utils.py` (`get_latent_dec`).
 - LLM judges: not in mechtools. Projects keep their own on top of `mechtools.openrouter.chat` (reference shapes: `RubricJudge` in `weirdchat/weirdchat/judge.py`, `value-leakage/src/value_leakage/judge.py`).
 
+## Tests
+
+- `./test.sh` runs pytest offline against the local HF cache. Tests that need a tokenizer or model from the cache carry the `hf` marker (added automatically to any test using the `tok`, `qwen` or `tiny_bridge` fixtures) and skip when it is absent; `./test.sh -m "not hf"` runs the rest anywhere. The integration tests of sampling, hooks, readouts and loading use `hf-internal-testing/tiny-random-LlamaForCausalLM` through the `tiny_bridge` fixture in `tests/conftest.py`; `hf download hf-internal-testing/tiny-random-LlamaForCausalLM` puts it in the cache.
+- Network code is tested against `httpx.MockTransport` and fakes of `openrouter.complete`; no test makes an API call.
+
 ## API runs
 
-- `OPENROUTER_API_KEY` comes from the first `.env` found walking up from the cwd when mechtools is imported: the project's when run from its directory. This repo has no `.env`, so from here the walk continues to `~/wgmn` and `~`. A missing key raises a `RuntimeError` naming the file it looked at. Never print the key.
+- `OPENROUTER_API_KEY` comes from the first `.env` found walking up from the cwd when mechtools is imported: the project's when run from its directory. This repo has no `.env`, so from here the walk continues to `~/wgmn` and `~`. A missing key raises a `RuntimeError` naming the file it looked at. A variable already set in the environment keeps its value (a shell export or a command-line `VAR=...` wins over the file) and import prints a note naming it. Never print the key.
 - Live calls cost money. The tests use fakes; keep any live check to a few requests with small `max_tokens`, and report the spend.
-- Batch helpers go through `gather_bar`, whose status line separates slow from throttled, counts failed attempts by cause, and shows dollars. A coroutine that exhausts its retries yields `None` and a rerun fills the deficit; auth and credit errors stop the batch.
+- Batch helpers go through `gather_bar`, whose status line separates slow from throttled, counts failed attempts by cause, and shows dollars. A coroutine that exhausts its retries yields `None` and a rerun fills the deficit; auth and credit errors stop the batch, and so does a batch whose first 8 coroutines fail before any succeeds (`abort_after`): a bad model, provider or parameter, or an endpoint that is down.
 - CoT resampling: run `mechtools.resample.probe` on the model's endpoints before any paid run, and read the `mechtools.resample` module docstring, which is the checklist of what to verify, what each failure looks like, and the pitfalls. The measurements behind it (weirdchat, 2026-09) are in `docs/openrouter_provider_findings.md`; rosters change, so probe rather than trust the file.
 
 ## Todo

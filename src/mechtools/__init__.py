@@ -3,9 +3,8 @@ import random
 import IPython
 import numpy as np
 import torch as t
-from dotenv import find_dotenv, load_dotenv
-from tqdm import tqdm
 
+from mechtools.bars import *
 from mechtools.colors import *
 from mechtools.hooks import *
 from mechtools.lens import *
@@ -23,7 +22,7 @@ if IPYTHON is not None:
     IPYTHON.run_line_magic("load_ext", "autoreload")
     IPYTHON.run_line_magic("autoreload", "2")
 
-load_dotenv(find_dotenv(usecwd=True))  # the first .env found walking up from the cwd: the project's, when run from its directory
+load_env()  # the first .env found walking up from the cwd: the project's, when run from its directory. A variable already set in the environment keeps its value, and a note names it
 
 def tec(): t.cuda.empty_cache()
 
@@ -31,7 +30,3 @@ def set_seed(seed: int) -> None:
     t.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-def pbar(iterable=None, desc: str = "", color: str = cyan, ncols: int = 120, **kwargs) -> tqdm:
-    """tqdm with the house style: colored description, fixed width, ascii ' >=' fill."""
-    return tqdm(iterable, desc=color + desc, ncols=ncols, ascii=" >=", **kwargs)
