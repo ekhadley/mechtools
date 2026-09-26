@@ -2,8 +2,9 @@ import math
 
 import torch as t
 from torch import Tensor
-from tqdm import trange
 from scipy.cluster.hierarchy import linkage, fcluster
+
+from mechtools.bars import pbar
 
 def normed(x: Tensor) -> Tensor:
     return t.nn.functional.normalize(x, dim=-1)
@@ -28,18 +29,18 @@ def topk_vector_matches(vectors: Tensor, test_vector: Tensor, k: int = 10, norma
     pos, neg = sims.topk(min(k, len(sims))), sims.topk(min(k, len(sims)), largest=False)
     return {"pos_indices": pos.indices, "pos_sims": pos.values, "neg_indices": neg.indices, "neg_sims": neg.values}
 
-def kmeans(x: Tensor, k: int, iters: int = 50, seed: int = 0) -> tuple[Tensor, Tensor]:
-    """Spherical k-means. x: [n, d]. Returns (labels [n], centroids [k, d])."""
+def kmeans(x: Tensor, k: int, iters: int = 50, seed: int = 0, quiet: bool = False) -> tuple[Tensor, Tensor]:
+    """Spherical k-means. x: [n, d]. Returns (labels [n], centroids [k, d]). quiet hides the progress bar."""
     x = normed(x.float())
     centroids = x[t.randperm(len(x), generator=t.Generator(device=x.device).manual_seed(seed), device=x.device)[:k]]
-    for _ in trange(iters, desc="kmeans"):
+    for _ in pbar(range(iters), desc="kmeans", disable=quiet):
         labels = (x @ centroids.T).argmax(-1)
         centroids = normed(t.zeros_like(centroids).index_add_(0, labels, x))
     return labels, centroids
 
-def hierarchical_kmeans(x: Tensor, k_fine: int = 4096, k_coarse: int = 512, iters: int = 50, seed: int = 0) -> tuple[Tensor, Tensor]:
+def hierarchical_kmeans(x: Tensor, k_fine: int = 4096, k_coarse: int = 512, iters: int = 50, seed: int = 0, quiet: bool = False) -> tuple[Tensor, Tensor]:
     """Spherical k-means with k_fine clusters, then average-linkage cosine agglomeration of the non-empty fine centroids into k_coarse groups. Returns (labels [n], centroids [k_coarse, d])."""
-    fine_labels, fine_centroids = kmeans(x, k_fine, iters, seed)
+    fine_labels, fine_centroids = kmeans(x, k_fine, iters, seed, quiet)
     alive = t.bincount(fine_labels, minlength=k_fine) > 0
     merge = t.full((k_fine,), -1, device=x.device)
     merge[alive] = t.as_tensor(fcluster(linkage(fine_centroids[alive].cpu().numpy(), method="average", metric="cosine"), k_coarse, criterion="maxclust") - 1, device=x.device, dtype=t.long)

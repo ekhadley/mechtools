@@ -12,6 +12,7 @@ import httpx
 from dotenv import find_dotenv
 from tqdm import tqdm
 
+from mechtools.bars import pbar
 from mechtools.colors import *
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
@@ -140,7 +141,7 @@ async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow
     global _stats
     _stats = s = Stats()
     sem, fails, n_ok, t0 = asyncio.Semaphore(concurrency), Counter(), 0, time.monotonic()
-    bar = tqdm(total=len(coros), desc=f"{cyan}{desc}{endc}", bar_format="{desc} {bar:15} {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {unit}", ascii=" >=", dynamic_ncols=True)
+    bar = pbar(total=len(coros), desc=desc + endc, bar_format="{desc} {bar:15} {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {unit}", dynamic_ncols=True)  # endc: the status line after the name colors its own parts
 
     def status() -> str:
         done = n_ok + sum(fails.values())
