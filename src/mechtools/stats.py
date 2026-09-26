@@ -5,6 +5,8 @@ from torch import Tensor
 from tqdm import trange
 from scipy.cluster.hierarchy import linkage, fcluster
 
+from mechtools.colors import yellow, endc
+
 def normed(x: Tensor) -> Tensor:
     return t.nn.functional.normalize(x, dim=-1)
 
@@ -29,21 +31,35 @@ def topk_vector_matches(vectors: Tensor, test_vector: Tensor, k: int = 10, norma
     return {"pos_indices": pos.indices, "pos_sims": pos.values, "neg_indices": neg.indices, "neg_sims": neg.values}
 
 def kmeans(x: Tensor, k: int, iters: int = 50, seed: int = 0) -> tuple[Tensor, Tensor]:
-    """Spherical k-means. x: [n, d]. Returns (labels [n], centroids [k, d])."""
+    """Spherical k-means. x: [n, d]. Returns (labels [n], centroids [k, d]). Stops once no label changes between passes; prints a note when that has not happened by iters, and one naming how many clusters are empty (their centroids are zero vectors)."""
+    assert 1 <= k <= len(x) and iters >= 1, f"k={k} clusters for {len(x)} points, {iters} iterations"
     x = normed(x.float())
     centroids = x[t.randperm(len(x), generator=t.Generator(device=x.device).manual_seed(seed), device=x.device)[:k]]
-    for _ in trange(iters, desc="kmeans"):
-        labels = (x @ centroids.T).argmax(-1)
+    labels, changed = None, len(x)
+    bar = trange(iters, desc="kmeans")
+    for _ in bar:
+        new = (x @ centroids.T).argmax(-1)
+        changed = len(x) if labels is None else int((new != labels).sum())
+        labels = new
+        if changed == 0:
+            break
         centroids = normed(t.zeros_like(centroids).index_add_(0, labels, x))
+    bar.close()
+    if changed:
+        print(f"  {yellow}kmeans: not converged after {iters} iterations, {changed} labels changed on the last pass{endc}")
+    if empty := int((t.bincount(labels, minlength=k) == 0).sum()):
+        print(f"  {yellow}kmeans: {empty} of {k} clusters are empty (zero centroids){endc}")
     return labels, centroids
 
 def hierarchical_kmeans(x: Tensor, k_fine: int = 4096, k_coarse: int = 512, iters: int = 50, seed: int = 0) -> tuple[Tensor, Tensor]:
-    """Spherical k-means with k_fine clusters, then average-linkage cosine agglomeration of the non-empty fine centroids into k_coarse groups. Returns (labels [n], centroids [k_coarse, d])."""
+    """Spherical k-means with k_fine clusters, then average-linkage cosine agglomeration of the non-empty fine centroids into k_coarse groups. Returns (labels [n], centroids [k_coarse, d]). Prints a note when the agglomeration yields fewer than k_coarse groups (the unused centroids are zero vectors)."""
     fine_labels, fine_centroids = kmeans(x, k_fine, iters, seed)
     alive = t.bincount(fine_labels, minlength=k_fine) > 0
     merge = t.full((k_fine,), -1, device=x.device)
     merge[alive] = t.as_tensor(fcluster(linkage(fine_centroids[alive].cpu().numpy(), method="average", metric="cosine"), k_coarse, criterion="maxclust") - 1, device=x.device, dtype=t.long)
     labels = merge[fine_labels]
+    if (n_groups := int(merge.max().item()) + 1) < k_coarse:
+        print(f"  {yellow}hierarchical_kmeans: agglomeration gave {n_groups} groups, not {k_coarse}; the remaining centroids are zero vectors{endc}")
     centroids = normed(t.zeros(k_coarse, x.shape[1], device=x.device).index_add_(0, labels, normed(x.float())))
     return labels, centroids
 

@@ -2,6 +2,7 @@ import pytest
 import torch as t
 from transformers import AutoTokenizer
 
+from mechtools.colors import endc, underline
 from mechtools.tokens import *
 
 MODELS = ["Qwen/Qwen3-0.6B", "Qwen/Qwen3-8B", "Qwen/Qwen3.6-27B", "Qwen/Qwen3.8-27B", "Qwen/Qwen2.5-3B-Instruct", "google/gemma-3-1b-it", "google/gemma-3-4b-it", "meta-llama/Llama-3.2-1B-Instruct", "meta-llama/Llama-3.1-8B-Instruct", "berkeley-nest/Starling-LM-7B-alpha", "thinkingmachines/Inkling"]
@@ -96,3 +97,20 @@ def test_completion_loss():
     expected = -(lp[0, 1, 3] + lp[0, 2, 4] + lp[0, 3, 5]) / 3
     assert t.isclose(completion_loss(logits, toks, mask), expected)
     assert t.isclose(completion_loss(lp, toks, mask, is_logprobs=True), expected)
+
+def test_to_ids_special_tokens_and_shape(tok):
+    ids = to_ids("Hello world.", tok, add_special_tokens=False)
+    assert ids == tok.encode("Hello world.", add_special_tokens=False) and to_str_toks("Hello world.", tok, add_special_tokens=False) == [tok.decode(i) for i in ids]
+    assert to_ids("Hello world.", tok) == tok.encode("Hello world.")  # the default adds BOS where the tokenizer does
+    assert to_ids(t.tensor([[[1, 2]]]), tok) == [1, 2] == to_ids([[1, 2]], tok)
+    with pytest.raises(ValueError, match="one sequence"):
+        to_ids(t.tensor([[1, 2], [3, 4]]), tok)
+
+def test_underline_stoks(tok):
+    s = underline_stoks("Hello world.", tok)
+    assert s.endswith(endc) and "Hello" in s and s.count(underline) >= 1
+
+def test_apply_chat_template_leaves_the_tokenizer_alone(tok):
+    before = (tok.pad_token_id, tok.padding_side)
+    apply_chat_template(tok, ["hi", CONV])
+    assert (tok.pad_token_id, tok.padding_side) == before

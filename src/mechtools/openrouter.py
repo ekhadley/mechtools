@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 import httpx
-from dotenv import find_dotenv
+from dotenv import dotenv_values, find_dotenv, load_dotenv
 from tqdm import tqdm
 
 from mechtools.colors import *
@@ -62,6 +62,18 @@ def _key() -> str:
         found = find_dotenv(usecwd=True)
         raise RuntimeError(f"OPENROUTER_API_KEY is not set: {f'{found} was loaded when mechtools was imported and does not set it' if found else f'no .env found walking up from {os.getcwd()}'}. Put it in the project's .env and run from the project directory.")
     return os.environ["OPENROUTER_API_KEY"]
+
+
+def load_env() -> list[str]:
+    """Loads the first .env found walking up from the cwd (the project's, when run from its directory) into os.environ without overriding variables already set, so a shell export or a command-line VAR=... still wins, and prints a note naming each variable whose environment value differs from the file's. Returns those names. Importing mechtools calls this."""
+    found = find_dotenv(usecwd=True)
+    if not found:
+        return []
+    load_dotenv(found)
+    shadowed = [k for k, v in dotenv_values(found).items() if v is not None and k in os.environ and os.environ[k] != v]
+    for k in shadowed:
+        print(f"  {yellow}{k} is set in the environment to a different value than in {found}; the environment's value is in use{endc}")
+    return shadowed
 
 
 async def _post(client: httpx.AsyncClient, path: str, payload: dict, attempts: int, timeout: float) -> dict:
@@ -134,8 +146,9 @@ def flat(body: dict) -> dict:
             "prompt_tokens": usage["prompt_tokens"], "completion_tokens": usage["completion_tokens"], "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"), "cost": usage["cost"]}
 
 
-async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow: tuple[type[Exception], ...] = (RequestFailed,)) -> list:
+async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow: tuple[type[Exception], ...] = (RequestFailed,), abort_after: int | None = 8) -> list:
     """Awaits coros at most concurrency at a time under a progress bar; results in order. A coro that raises one of swallow yields None, counted by cause with the first of each kind printed above the bar; any other exception cancels the rest and propagates.
+    abort_after: once that many coroutines have failed before any succeeded, the batch is failing systematically (a bad model, provider or parameter, or an endpoint that is down) and a RuntimeError stops it instead of running every coroutine to None; None disables the check. Failures after a success stay per-request Nones.
     The status line: coroutines ok/fail, dollars spent < the projected total for the whole run (mean cost per finished coroutine, failures included, times len(coros)), open requests and the age of the oldest (slow models show here, not as errors), mean seconds per successful request, requests sleeping in backoff, finish reasons other than stop (length = truncated), failed attempts by cause (429, 503, timeout, envelope 429, finish error, ...). tqdm clips it to the terminal width; the summary printed at the end has everything."""
     global _stats
     _stats = s = Stats()
@@ -164,6 +177,8 @@ async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow
                 fails[why] += 1
                 if fails[why] == 1: bar.write(f"  {red}failed ({why}): {str(e)[:240]}{endc}")
                 r = None
+                if abort_after and not n_ok and sum(fails.values()) >= abort_after:
+                    raise RuntimeError(f"{sum(fails.values())} coroutines failed before any succeeded ({', '.join(f'{k}×{v}' for k, v in fails.most_common())}); stopping the batch: a bad model, provider or parameter, or the endpoint is down") from e
             bar.unit = status()
             bar.update()
             return r

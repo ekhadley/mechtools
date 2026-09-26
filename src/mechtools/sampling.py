@@ -3,30 +3,44 @@ from torch import Tensor
 from tqdm import tqdm
 from transformers.cache_utils import DynamicLayer
 
-def stream_toks(model, toks: Tensor, new_toks: int = 512):
-    """Yield temperature-1 sampled token ids from a TransformerBridge, one at a time, until eos."""
+def stop_ids_of(model, tokenizer=None) -> set[int]:
+    """The ids generation stops on: generation_config.eos_token_id (an int or a list; the HF model's, or the one under a TransformerBridge) plus the tokenizer's eos_token_id.
+    Chat models often end a turn on a token that is not the tokenizer's eos (gemma-3: <end_of_turn> 106 vs <eos> 1) and only generation_config lists it. Raises when neither source has an id."""
+    tokenizer = tokenizer if tokenizer is not None else model.tokenizer
+    gen_cfg = getattr(model, "generation_config", None) or getattr(getattr(model, "original_model", None), "generation_config", None)
+    eos = getattr(gen_cfg, "eos_token_id", None)
+    ids = {*(eos if isinstance(eos, (list, tuple)) else [eos]), tokenizer.eos_token_id} - {None}
+    if not ids:
+        raise ValueError("neither generation_config nor the tokenizer has an eos_token_id: pass stop_ids")
+    return ids
+
+def stream_toks(model, toks: Tensor, new_toks: int = 512, stop_ids: set[int] | None = None):
+    """Yield temperature-1 sampled token ids from a TransformerBridge, one at a time, until a stop id (stop_ids_of(model) by default) or new_toks."""
+    stop = stop_ids if stop_ids is not None else stop_ids_of(model)
     past = None
     for _ in range(new_toks):
         logits, past = model(toks, return_type="logits_and_cache", past_key_values=past, use_cache=True)
         toks = t.multinomial(t.softmax(logits[0, -1].float(), dim=-1), num_samples=1).unsqueeze(0)
-        if toks.item() == model.tokenizer.eos_token_id:
+        if toks.item() in stop:
             break
         yield toks.item()
 
-def stream_toks_hf(model, tokenizer, toks: Tensor, new_toks: int = 512):
+def stream_toks_hf(model, tokenizer, toks: Tensor, new_toks: int = 512, stop_ids: set[int] | None = None):
     """stream_toks for a raw HF causal LM."""
+    stop = stop_ids if stop_ids is not None else stop_ids_of(model, tokenizer)
     past = None
     for _ in range(new_toks):
         out = model(toks, past_key_values=past, use_cache=True)
         past = out.past_key_values
         toks = t.multinomial(t.softmax(out.logits[0, -1].float(), dim=-1), num_samples=1).unsqueeze(0)
-        if toks.item() == tokenizer.eos_token_id:
+        if toks.item() in stop:
             break
         yield toks.item()
 
-def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:bool = False) -> list[list[int]]:
-    """n independent temperature-1 samples from one prompt [1, seq], generated as a batch; each row is returned cut before its first eos."""
-    eos = model.tokenizer.eos_token_id
+def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet: bool = False, stop_ids: set[int] | None = None) -> list[list[int]]:
+    """n independent temperature-1 samples from one prompt [1, seq], generated as a batch; each row is returned cut before its first stop id (stop_ids_of(model) by default).
+    A returned row of length new_toks hit the cap without stopping; a shorter one stopped."""
+    stop = t.tensor(sorted(stop_ids if stop_ids is not None else stop_ids_of(model)), device=prompt_toks.device)
     toks = prompt_toks.repeat(n, 1)
     past = None
     gen = t.zeros(n, 0, dtype=t.long, device=prompt_toks.device)
@@ -37,15 +51,16 @@ def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:
         logits, past = model(toks, return_type="logits_and_cache", past_key_values=past, use_cache=True)
         toks = t.multinomial(t.softmax(logits[:, -1].float(), dim=-1), num_samples=1)
         gen = t.cat([gen, toks], dim=1)
-        ended = alive & (toks.squeeze(1) == eos)
+        ended = alive & t.isin(toks.squeeze(1), stop)
         lengths[ended] = step
         alive &= ~ended
         if not alive.any(): break
     return [gen[i, :lengths[i]].tolist() for i in range(n)]
 
-def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int) -> list[list[int]]:
-    """n independent temperature-1 samples from one prompt [1, seq] as a rolling batch: a row that ends (eos or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos."""
-    eos, last, plen = model.tokenizer.eos_token_id, prompt_toks[0, -1], prompt_toks.shape[1] - 1
+def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int, stop_ids: set[int] | None = None) -> list[list[int]]:
+    """n independent temperature-1 samples from one prompt [1, seq] as a rolling batch: a row that ends (a stop id, stop_ids_of(model) by default, or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens.
+    Each sample is cut before its first stop id; one of length new_toks hit the cap without stopping."""
+    stop, last, plen = (stop_ids if stop_ids is not None else stop_ids_of(model)), prompt_toks[0, -1], prompt_toks.shape[1] - 1
     B = min(batch_size, n)
     _, cache = model(prompt_toks[:, :-1].repeat(B, 1), return_type="logits_and_cache", use_cache=True)
     template = [(l.keys[0].clone(), l.values[0].clone()) if isinstance(l, DynamicLayer) else (l.conv_states[0][0].clone(), l.recurrent_states[0][0].clone()) for l in cache.layers]
@@ -64,10 +79,10 @@ def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
             row.append(tok)
         keep = []
         for i, row in enumerate(gen):
-            if row[-1] != eos and len(row) < new_toks:
+            if row[-1] not in stop and len(row) < new_toks:
                 keep.append(i)
                 continue
-            out.append(row[:-1] if row[-1] == eos else row)
+            out.append(row[:-1] if row[-1] in stop else row)
             bar.update()
             if n_started == n: continue
             n_started += 1
@@ -80,4 +95,5 @@ def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
             cache.reorder_cache(t.tensor(keep, device=toks.device))
             toks, n_real, gen = toks[keep], n_real[keep], [gen[i] for i in keep]
         t.cuda.empty_cache()
+    bar.close()
     return out

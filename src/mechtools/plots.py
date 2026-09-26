@@ -202,7 +202,7 @@ def line(
         y: 1D values to plot, or several series to plot as separate lines: either a list of 1D series or a 2D array with one line per row.
         renderer: plotly renderer to show with, e.g. "browser". None uses the default.
         x: x values for the points, shared by every line. Defaults to 0, 1, 2, ... With use_secondary_yaxis, a pair of x arrays.
-        names: legend name per line, in order. Consumed as the traces are named, so pass a list you don't need afterwards.
+        names: legend name per line, in order, one per trace.
         labels: axis names, e.g. {"x": "Layer", "y": "Loss"}. With use_secondary_yaxis, keys are "x", "y1", "y2".
         title: figure title.
         template: plotly theme, e.g. "simple_white".
@@ -248,7 +248,9 @@ def line(
         )
         fig = px.line(y=y, **px_kwargs).update_layout(**layout)
         if names is not None:
-            fig.for_each_trace(lambda trace: trace.update(name=names.pop(0)))
+            assert len(names) == len(fig.data), f"got {len(names)} names for {len(fig.data)} lines"
+            for trace, name in zip(fig.data, names):
+                trace.update(name=name)
     return fig if return_fig else fig.show(renderer=renderer)
 
 
@@ -415,7 +417,7 @@ def hist(
     Args:
         tensor: 1D values to bin, or several series to overlay: either a list of 1D series or a 2D array with one series per row.
         renderer: plotly renderer to show with, e.g. "browser". None uses the default.
-        names: legend name per series, in order. With a list of series it is consumed as the traces are named, so pass a list you don't need afterwards.
+        names: legend name per series, in order.
         labels: axis names, e.g. {"x": "Logit diff", "y": "Count"}.
         title: figure title.
         template: plotly theme, e.g. "simple_white".
@@ -453,8 +455,9 @@ def hist(
             layout["xaxis_title_text"] = labels.get("x", "")
             layout["yaxis_title_text"] = labels.get("y", "")
         fig = go.Figure(layout=go.Layout(**layout))
-        for x in arr:
-            fig.add_trace(go.Histogram(x=x, name=names.pop(0) if names is not None else None, nbinsx=nbins, opacity=opacity, histnorm=histnorm, bingroup="x"))  # bingroup makes the series share bin edges, like px.histogram does
+        assert names is None or len(names) == len(arr), f"got {len(names)} names for {len(arr)} series"
+        for i, x in enumerate(arr):
+            fig.add_trace(go.Histogram(x=x, name=names[i] if names is not None else None, nbinsx=nbins, opacity=opacity, histnorm=histnorm, bingroup="x"))  # bingroup makes the series share bin edges, like px.histogram does
     else:
         px_kwargs = drop_none(
             labels=labels, title=title, template=template, height=height, width=width,

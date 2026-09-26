@@ -3,7 +3,6 @@ import random
 import IPython
 import numpy as np
 import torch as t
-from dotenv import find_dotenv, load_dotenv
 from tqdm import tqdm
 
 from mechtools.colors import *
@@ -17,13 +16,14 @@ from mechtools.sampling import *
 from mechtools.stats import *
 from mechtools.tables import *
 from mechtools.tokens import *
+from mechtools.openrouter import load_env
 
 IPYTHON = IPython.get_ipython()
 if IPYTHON is not None:
     IPYTHON.run_line_magic("load_ext", "autoreload")
     IPYTHON.run_line_magic("autoreload", "2")
 
-load_dotenv(find_dotenv(usecwd=True))  # the first .env found walking up from the cwd: the project's, when run from its directory
+load_env()  # the first .env found walking up from the cwd: the project's, when run from its directory. A variable already set in the environment keeps its value, and a note names it
 
 def tec(): t.cuda.empty_cache()
 

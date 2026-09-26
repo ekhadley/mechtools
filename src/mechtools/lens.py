@@ -35,9 +35,13 @@ def get_lens_logits(h: Tensor, layer: int, model, jlens: dict) -> Tensor:
     return model.unembed(model.ln_final(jlens_transport(h, layer, jlens)))
 
 def get_jlens_token_vec(token: str | int, layer: int, model, jlens: dict) -> Tensor:
-    """Residual direction at `layer` that the j-lens maps onto a token's unembedding."""
-    tok_id = model.tokenizer.encode(token)[0] if isinstance(token, str) else token
-    return jlens["J"][layer].to(model.W_U.dtype).T @ model.W_U[:, tok_id]
+    """Residual direction at `layer` that the j-lens maps onto a token's unembedding. A str must be exactly one token (encoded without BOS); pass the id otherwise."""
+    if isinstance(token, str):
+        ids = model.tokenizer.encode(token, add_special_tokens=False)
+        if len(ids) != 1:
+            raise ValueError(f"{token!r} is {len(ids)} tokens ({ids}); pass one token's string or its id")
+        token = ids[0]
+    return jlens["J"][layer].to(model.W_U.dtype).T @ model.W_U[:, token]
 
 def get_template_idx(template: str, tlens: dict) -> int:
     return tlens["words"].index(template)
@@ -72,12 +76,12 @@ def fmt3(x: float) -> str:
 def cluster_color(c: int) -> str:
     return f"hsl({c * 0.618 % 1 * 360:.0f},70%,65%)"
 
-def get_toks(input_src, tokenizer=None) -> tuple[list[str] | None, list[int] | None]:
-    """(str tokens, ids) of a readout's input_src: None or a list of str tokens as is (ids None); a string, ids (tensor or list), or a conversation is tokenized, which needs tokenizer."""
+def get_toks(input_src, tokenizer=None, add_special_tokens: bool = True) -> tuple[list[str] | None, list[int] | None]:
+    """(str tokens, ids) of a readout's input_src: None or a list of str tokens as is (ids None); a string, ids (tensor or list), or a conversation is tokenized, which needs tokenizer. add_special_tokens applies to a string (see to_ids)."""
     if input_src is None or (isinstance(input_src, list) and isinstance(input_src[0], str)):
         return input_src, None
     assert tokenizer is not None, "input_src needs tokenizing, pass tokenizer"
-    ids = to_ids(input_src, tokenizer)
+    ids = to_ids(input_src, tokenizer, add_special_tokens)
     return [tokenizer.decode(i) for i in ids], ids
 
 def per_pos(fn, pos: int | list[int]):
@@ -123,13 +127,13 @@ def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = T
 
 NEXT_COLOR = "#e88"
 
-def show_logits(input_src, model=None, logits=None, tokenizer=None, k: int = 10, pos: list[int] | None = None, title: str | None = "logits", ctx: int = 32, n_cols: int = 4):
+def show_logits(input_src, model=None, logits=None, tokenizer=None, k: int = 10, pos: list[int] | None = None, title: str | None = "logits", ctx: int = 32, n_cols: int = 4, add_special_tokens: bool = True):
     """Top-k next-token table for one position of the input at a time: click a token in the strip above (or use the up/down arrows) to see what the model predicts after it.
     Pass `model` to run it on the input, or `logits` [seq, vocab] (or [1, seq, vocab]) from your own forward pass. The row of the input's actual next token is colored, and appended below the top-k when it is not in it.
-    input_src (see get_toks) is a string, ids, a conversation, or str tokens; `pos` restricts the readout to those positions, all of them by default."""
+    input_src (see get_toks) is a string (add_special_tokens=False for a self-rendered template string), ids, a conversation, or str tokens; `pos` restricts the readout to those positions, all of them by default."""
     assert (model is None) != (logits is None), "pass either model or logits"
     tokenizer = tokenizer if tokenizer is not None else model.tokenizer
-    toks, ids = get_toks(input_src, tokenizer)
+    toks, ids = get_toks(input_src, tokenizer, add_special_tokens)
     if logits is None:
         logits = model(t.tensor(ids)[None])
     logits = logits.squeeze(0) if logits.ndim == 3 else logits

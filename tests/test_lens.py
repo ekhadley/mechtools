@@ -1,6 +1,9 @@
 import re
 
-from mechtools.lens import tabbed, token_strip
+import pytest
+import torch as t
+
+from mechtools.lens import get_jlens_token_vec, tabbed, token_strip
 
 TOKS = [f"t{i}" for i in range(20)]
 
@@ -18,7 +21,6 @@ def test_tabbed_stacks_panes_and_wires_head():
     assert "marks.forEach(x=>x.onclick" in h and "x.classList.toggle('on',x.dataset.k==cur.join(','))" in h
 
 def test_show_logits_marks_every_position_and_the_actual_next_token(monkeypatch):
-    import torch as t
     from mechtools import lens
     out = []
     monkeypatch.setattr(lens, "display", lambda x: out.append(x.data))
@@ -33,3 +35,14 @@ def test_show_logits_marks_every_position_and_the_actual_next_token(monkeypatch)
     assert p0.count("<tr") == 4 and p0.count("color:#e88") == 1 and "#1</span></td><td>&#x27;&lt;1&gt;" in p0  # actual next token colored in place at rank 1
     assert p1.count("<tr") == 5 and p1.split("<tr")[-1].count("#8") == 1 and "&lt;4&gt;" in p1.split("<tr")[-1]  # outside the top-k, appended with its rank
     assert p2.count("color:#e88") == 0  # last position has no next token
+
+def test_get_jlens_token_vec_uses_the_token_not_bos():
+    class Tok:
+        def encode(self, s, add_special_tokens=True):
+            return ([0] if add_special_tokens else []) + [10 + i for i in range(len(s.split()))]  # 0 is BOS, as on Llama or Gemma
+    model = type("M", (), {"tokenizer": Tok(), "W_U": t.randn(4, 16)})()
+    jlens = {"J": t.randn(2, 4, 4)}
+    v = get_jlens_token_vec("hello", 1, model, jlens)
+    assert t.allclose(v, jlens["J"][1].T @ model.W_U[:, 10]) and t.equal(v, get_jlens_token_vec(10, 1, model, jlens))
+    with pytest.raises(ValueError, match="2 tokens"):
+        get_jlens_token_vec("hello world", 1, model, jlens)

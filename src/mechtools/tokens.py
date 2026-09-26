@@ -5,16 +5,22 @@ import torch as t
 from torch import Tensor
 from IPython.display import HTML, display
 
-def to_ids(inp: str | Tensor | list[int] | list[dict], tokenizer, **chat_kwargs) -> list[int]:
-    """Token ids of a string, a tensor/list of ids, or a chat conversation (list of role/content dicts, tokenized with apply_chat_template and chat_kwargs)."""
+from mechtools.colors import endc, underline
+
+def to_ids(inp: str | Tensor | list[int] | list[dict], tokenizer, add_special_tokens: bool = True, **chat_kwargs) -> list[int]:
+    """Token ids of a string, a tensor/list of ids (one sequence: shape [seq] or [1, seq]), or a chat conversation (list of role/content dicts, tokenized with apply_chat_template and chat_kwargs).
+    add_special_tokens applies to a string: BOS on tokenizers that add one, so pass False for a self-rendered template string. A conversation's special tokens come from the template."""
     if isinstance(inp, str):
-        return tokenizer.encode(inp)
+        return tokenizer.encode(inp, add_special_tokens=add_special_tokens)
     if isinstance(inp, list) and inp and isinstance(inp[0], dict):
         return tokenizer.apply_chat_template(inp, tokenize=True, return_dict=False, **chat_kwargs)
-    return t.as_tensor(inp).flatten().tolist()
+    ids = t.as_tensor(inp)
+    if ids.ndim > 1 and any(d != 1 for d in ids.shape[:-1]):
+        raise ValueError(f"to_ids takes one sequence, got shape {tuple(ids.shape)}")
+    return ids.flatten().tolist()
 
-def to_str_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, **chat_kwargs) -> list[str]:
-    return [tokenizer.decode(tok) for tok in to_ids(inp, tokenizer, **chat_kwargs)]
+def to_str_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, add_special_tokens: bool = True, **chat_kwargs) -> list[str]:
+    return [tokenizer.decode(tok) for tok in to_ids(inp, tokenizer, add_special_tokens, **chat_kwargs)]
 
 TOKS_CSS = "<style>.tk{cursor:default} .tk span:hover{outline:1px solid #e66} .tk span[data-p]{cursor:pointer;border-bottom:2px solid #666} .tk span[data-p].on{border-bottom-color:#e66;background:#503a3a !important}</style>"
 
@@ -25,10 +31,10 @@ def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | list[int
     spans = "".join(f"<span {f'data-p={tabs[i]} ' if i in tabs else ''}title='{i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}' style='background:{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i in sel and not tabs else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
     return f"{TOKS_CSS}<div class='tk' style='white-space:pre-wrap;line-height:1.8'>{'… ' if lo > 0 else ''}{spans}{' …' if hi < len(strs) else ''}</div>"
 
-def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
+def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, add_special_tokens: bool = True, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
     """Rich HTML display of a prompt's tokens, hover shows index, token id and repr, the token at pos (if given) underlined.
-    A conversation (list of role/content dicts) goes through apply_chat_template; the chat kwargs and any template_kwargs (e.g. enable_thinking=False for Qwen3) are forwarded to it."""
-    ids = to_ids(inp, tokenizer, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message, tools=tools, chat_template=chat_template, **template_kwargs)
+    add_special_tokens applies to a string (see to_ids). A conversation (list of role/content dicts) goes through apply_chat_template; the chat kwargs and any template_kwargs (e.g. enable_thinking=False for Qwen3) are forwarded to it."""
+    ids = to_ids(inp, tokenizer, add_special_tokens, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message, tools=tools, chat_template=chat_template, **template_kwargs)
     display(HTML(f"<div style='background:#111;color:#ddd;font:12px monospace;padding:8px'>{toks_html([tokenizer.decode(i) for i in ids], ids, pos)}</div>"))
 
 def underline_stoks(toks: str | Tensor | list[int], tokenizer) -> str:
@@ -50,19 +56,22 @@ def get_turn_tok_idx(conversation: list[dict], turn: int, tokenizer, idx_point: 
     return {"start": start, "end": end, "both": (start, end)}[idx_point]
 
 def apply_chat_template(tokenizer, convs: str | list[str] | list[dict] | list[list[dict]], add_generation_prompt: bool = True, **chat_kwargs) -> tuple[Tensor, Tensor]:
-    """(input_ids, attention_mask) [batch, seq], left-padded. Each item of convs is a conversation (list of role/content dicts) or a user prompt string; a single item gives a batch of 1."""
+    """(input_ids, attention_mask) [batch, seq], left-padded. Each item of convs is a conversation (list of role/content dicts) or a user prompt string; a single item gives a batch of 1.
+    Each row is to_ids(conv, tokenizer, add_generation_prompt=..., **chat_kwargs), padded with the tokenizer's pad token or, when it has none, its eos (any id works: the mask covers it). The tokenizer is not modified."""
     convs = [convs] if isinstance(convs, str) or isinstance(convs[0], dict) else convs
     convs = [[{"role": "user", "content": c}] if isinstance(c, str) else c for c in convs]
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    side, tokenizer.padding_side = tokenizer.padding_side, "left"
-    out = tokenizer.apply_chat_template(convs, return_tensors="pt", return_dict=True, padding=True, add_generation_prompt=add_generation_prompt, **chat_kwargs)
-    tokenizer.padding_side = side
-    return out["input_ids"], out["attention_mask"]
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad is None:
+        raise ValueError("the tokenizer has neither a pad nor an eos token; set tokenizer.pad_token")
+    rows = [to_ids(c, tokenizer, add_generation_prompt=add_generation_prompt, **chat_kwargs) for c in convs]
+    width = max(len(r) for r in rows)
+    input_ids = t.tensor([[pad] * (width - len(r)) + r for r in rows])
+    attn = t.tensor([[0] * (width - len(r)) + [1] * len(r) for r in rows])
+    return input_ids, attn
 
 def get_assistant_mask(tokenizer, convs: list[dict] | list[list[dict]], include_eot: bool = True, **chat_kwargs) -> tuple[Tensor, Tensor, Tensor]:
     """(input_ids, attention_mask, assistant_mask), all [batch, seq] left-padded. assistant_mask is 1 on the content tokens of every assistant turn, plus the end-of-turn token after each if include_eot.
-    The mask marks the tokens to be predicted, as completion_loss expects."""
+    The mask marks the tokens to be predicted, as completion_loss expects. With include_eot the token after each assistant turn's content must be a special token, else a ValueError says so."""
     convs = [convs] if isinstance(convs[0], dict) else convs
     input_ids, attn = apply_chat_template(tokenizer, convs, add_generation_prompt=False, **chat_kwargs)
     mask = t.zeros_like(input_ids)
@@ -71,6 +80,10 @@ def get_assistant_mask(tokenizer, convs: list[dict] | list[list[dict]], include_
         for i, msg in enumerate(conv):
             if msg["role"] == "assistant":
                 start, end = get_turn_tok_idx(conv, i, tokenizer, "both", **chat_kwargs)
+                if include_eot:
+                    eot = input_ids[b, offset + end].item() if offset + end < input_ids.shape[1] else None
+                    if eot not in tokenizer.added_tokens_decoder:
+                        raise ValueError(f"the token after assistant turn {i}'s content is {None if eot is None else tokenizer.decode([eot])!r} (id {eot}), not a special token: this template does not end a turn with one token; pass include_eot=False")
                 mask[b, offset + start:offset + end + include_eot] = 1
     return input_ids, attn, mask
 
