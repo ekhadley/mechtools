@@ -1,14 +1,16 @@
 # mechtools
 
-Shared helpers for mechinterp research projects, importable locally (not published).
+Shared helpers for mechinterp research projects.
 
 ## Install
 
-Per project, from that project's directory:
+From a project's directory:
 
 ```
-uv add --editable ~/wgmn/mechtools
+uv add git+https://github.com/ekhadley/mechtools
 ```
+
+or, from a local clone, `uv add --editable path/to/mechtools`.
 
 Then `from mechtools import *` at the top of a script gives the whole prelude: color constants, `tec`, `set_seed`, `pbar` (tqdm with colored desc, `ncols=120`, ascii fill), and everything below. Importing also turns on IPython autoreload when in a kernel and loads the first `.env` found walking up from the current directory, the project's when run from the project directory; that is where `OPENROUTER_API_KEY` goes, and a missing key raises a `RuntimeError` that names the file it looked at. A variable already set in the environment keeps its value, so a shell export or a command-line `VAR=...` wins over the file, and import prints a note naming it.
 
@@ -41,7 +43,7 @@ Models are `TransformerBridge` objects (transformer-lens >= 3.8); there is no `H
 
 ## Standardization candidates
 
-From a scan of the 24 user-authored Python research projects in `~/wgmn`. Sorted by breadth of duplication times how identical the copies already are. "Projects" is how many define or use the thing.
+From a scan of 24 Python mechinterp research projects that each carried their own copies of these helpers. Sorted by breadth of duplication times how identical the copies already are. "Projects" is how many define or use the thing.
 
 | # | Candidate | Projects | Uniformity |
 |---|---|---|---|
