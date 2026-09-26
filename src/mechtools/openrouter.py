@@ -9,12 +9,14 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 import httpx
-from dotenv import find_dotenv
+from dotenv import dotenv_values, find_dotenv, load_dotenv
 from tqdm import tqdm
 
+from mechtools.bars import pbar
 from mechtools.colors import *
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
+_sleep = asyncio.sleep  # the backoff sleep, replaceable in tests
 
 
 class RequestFailed(Exception):
@@ -41,12 +43,18 @@ _stats = Stats()
 
 
 def _verdict(status: int, body: dict, text: str) -> tuple[str | None, str]:
-    """(None, "") for a usable response, else the (cause, detail) to retry on. 401/402 raise RuntimeError (no key, out of credits: stop everything); any other 4xx raises RequestFailed (retrying will not help)."""
+    """(None, "") for a usable response, else the (cause, detail) to retry on. 401/402 raise RuntimeError (no key, out of credits: stop everything); any other 4xx raises RequestFailed (retrying will not help).
+    A 200 is usable when it has choices, its finish_reason is not "error", and usage carries completion_tokens and cost (usage accounting is requested on every call; a body without it cannot be billed or flattened)."""
     err, meta = body.get("error") or {}, (body.get("error") or {}).get("metadata") or {}
     detail = " | ".join(str(x) for x in (err.get("message"), meta.get("provider_name"), meta.get("raw"), meta.get("provider_error_code"), meta.get("limit_source")) if x) if err else text[:300]
     if status == 200 and body.get("choices"):
         choice = body["choices"][0]
-        return (None, "") if choice.get("finish_reason") != "error" else ("finish error", json.dumps(choice)[:300])  # the provider aborted mid-stream; its usage counts are wrong too
+        if choice.get("finish_reason") == "error":
+            return "finish error", json.dumps(choice)[:300]  # the provider aborted mid-stream; its usage counts are wrong too
+        usage = body.get("usage") or {}
+        if usage.get("completion_tokens") is None or usage.get("cost") is None:
+            return "no usage", json.dumps(body)[:300]
+        return None, ""
     if status == 200:
         return f"envelope {err.get('code')}", detail  # a 200 whose body is an error: upstream 429s and provider failures come back this way
     if status in (401, 402):
@@ -64,19 +72,34 @@ def _key() -> str:
     return os.environ["OPENROUTER_API_KEY"]
 
 
+def load_env() -> list[str]:
+    """Loads the first .env found walking up from the cwd (the project's, when run from its directory) into os.environ without overriding variables already set, so a shell export or a command-line VAR=... still wins, and prints a note naming each variable whose environment value differs from the file's. Returns those names. Importing mechtools calls this."""
+    found = find_dotenv(usecwd=True)
+    if not found:
+        return []
+    load_dotenv(found)
+    shadowed = [k for k, v in dotenv_values(found).items() if v is not None and k in os.environ and os.environ[k] != v]
+    for k in shadowed:
+        print(f"  {yellow}{k} is set in the environment to a different value than in {found}; the environment's value is in use{endc}")
+    return shadowed
+
+
 async def _post(client: httpx.AsyncClient, path: str, payload: dict, attempts: int, timeout: float) -> dict:
-    """POST payload to path and return the body. Retries with doubling backoff (1, 3, 7, ... s) on network errors, timeouts, 408/429/5xx, a 200 with no choices, and finish_reason "error"; the first failure of each kind is printed."""
+    """POST payload to path and return the body. Retries with doubling backoff (1, 3, 7, ... s) on network errors, timeouts, 408/429/5xx, a 200 with no choices, no usage or an unparsable body, and finish_reason "error"; the first failure of each kind is printed."""
     s, rid, headers = _stats, id(payload), {"Authorization": f"Bearer {_key()}"}
     for attempt in range(attempts):
         if attempt:
             s.sleeping += 1
-            await asyncio.sleep(2 ** attempt - 1)
+            await _sleep(2 ** attempt - 1)
             s.sleeping -= 1
         s.open[rid] = start = time.monotonic()
         try:
             r = await client.post(OPENROUTER_URL + path, json=payload, headers=headers, timeout=timeout)
-            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-            why, detail = _verdict(r.status_code, body, r.text)
+            try:
+                body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            except ValueError:  # a truncated or non-JSON body under a JSON content type
+                body = None
+            why, detail = ("bad json", r.text[:300]) if body is None and r.status_code == 200 else _verdict(r.status_code, body or {}, r.text)
         except httpx.HTTPError as e:
             why, detail = "timeout" if isinstance(e, httpx.TimeoutException) else type(e).__name__, f"{type(e).__name__} {e}".strip()  # httpx timeouts stringify to nothing
         finally:
@@ -127,20 +150,21 @@ async def complete(prompt: str, model: str, provider: str | dict | None = None, 
 
 
 def flat(body: dict) -> dict:
-    """The common fields of either endpoint's body: text (message content, or the raw completion), reasoning, finish_reason, provider, model, prompt_tokens, completion_tokens, reasoning_tokens (wrong on many providers; count from text), cost (dollars). Store the body itself; it has more (reasoning_details with signatures, native_finish_reason, refusal, cache and cost breakdowns, the generation id)."""
+    """The common fields of either endpoint's body: text (message content, or the raw completion; None when the provider sent none), reasoning, finish_reason, provider, model, prompt_tokens, completion_tokens, reasoning_tokens (wrong on many providers; count from text), cost (dollars). Store the body itself; it has more (reasoning_details with signatures, native_finish_reason, refusal, cache and cost breakdowns, the generation id)."""
     choice, usage = body["choices"][0], body["usage"]
     msg = choice.get("message")  # chat bodies; a raw completion carries text and reasoning on the choice itself
     return {"text": msg["content"] if msg else choice["text"], "reasoning": (msg or choice).get("reasoning"), "finish_reason": choice.get("finish_reason"), "provider": body["provider"], "model": body["model"],
             "prompt_tokens": usage["prompt_tokens"], "completion_tokens": usage["completion_tokens"], "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens"), "cost": usage["cost"]}
 
 
-async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow: tuple[type[Exception], ...] = (RequestFailed,)) -> list:
+async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow: tuple[type[Exception], ...] = (RequestFailed,), abort_after: int | None = 8) -> list:
     """Awaits coros at most concurrency at a time under a progress bar; results in order. A coro that raises one of swallow yields None, counted by cause with the first of each kind printed above the bar; any other exception cancels the rest and propagates.
+    abort_after: once that many coroutines have failed before any succeeded, the batch is failing systematically (a bad model, provider or parameter, or an endpoint that is down) and a RuntimeError stops it instead of running every coroutine to None; None disables the check. Failures after a success stay per-request Nones.
     The status line: coroutines ok/fail, dollars spent < the projected total for the whole run (mean cost per finished coroutine, failures included, times len(coros)), open requests and the age of the oldest (slow models show here, not as errors), mean seconds per successful request, requests sleeping in backoff, finish reasons other than stop (length = truncated), failed attempts by cause (429, 503, timeout, envelope 429, finish error, ...). tqdm clips it to the terminal width; the summary printed at the end has everything."""
     global _stats
     _stats = s = Stats()
     sem, fails, n_ok, t0 = asyncio.Semaphore(concurrency), Counter(), 0, time.monotonic()
-    bar = tqdm(total=len(coros), desc=f"{cyan}{desc}{endc}", bar_format="{desc} {bar:15} {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {unit}", ascii=" >=", dynamic_ncols=True)
+    bar = pbar(total=len(coros), desc=desc + endc, bar_format="{desc} {bar:15} {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {unit}", dynamic_ncols=True)  # endc: the status line after the name colors its own parts
 
     def status() -> str:
         done = n_ok + sum(fails.values())
@@ -164,6 +188,8 @@ async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow
                 fails[why] += 1
                 if fails[why] == 1: bar.write(f"  {red}failed ({why}): {str(e)[:240]}{endc}")
                 r = None
+                if abort_after and not n_ok and sum(fails.values()) >= abort_after:
+                    raise RuntimeError(f"{sum(fails.values())} coroutines failed before any succeeded ({', '.join(f'{k}×{v}' for k, v in fails.most_common())}); stopping the batch: a bad model, provider or parameter, or the endpoint is down") from e
             bar.unit = status()
             bar.update()
             return r
