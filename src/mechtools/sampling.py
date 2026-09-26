@@ -3,30 +3,38 @@ from torch import Tensor
 from tqdm import tqdm
 from transformers.cache_utils import DynamicLayer
 
+def eos_ids(model, tokenizer=None) -> set[int]:
+    """Every id that ends a generation: the tokenizer's eos plus the ids in the model's generation_config, where a chat model's end-of-turn token often only appears (gemma-3's tokenizer eos is <eos> while turns end with <end_of_turn>; Llama-3 and Qwen3 list two or three)."""
+    tokenizer = tokenizer if tokenizer is not None else model.tokenizer
+    eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    ids = {tokenizer.eos_token_id} | (set(eos) if isinstance(eos, (list, tuple)) else {eos})
+    ids.discard(None)
+    return ids
+
 def stream_toks(model, toks: Tensor, new_toks: int = 512):
-    """Yield temperature-1 sampled token ids from a TransformerBridge, one at a time, until eos."""
-    past = None
+    """Yield temperature-1 sampled token ids from a TransformerBridge, one at a time, until an eos id (see eos_ids)."""
+    past, eos = None, eos_ids(model)
     for _ in range(new_toks):
         logits, past = model(toks, return_type="logits_and_cache", past_key_values=past, use_cache=True)
         toks = t.multinomial(t.softmax(logits[0, -1].float(), dim=-1), num_samples=1).unsqueeze(0)
-        if toks.item() == model.tokenizer.eos_token_id:
+        if toks.item() in eos:
             break
         yield toks.item()
 
 def stream_toks_hf(model, tokenizer, toks: Tensor, new_toks: int = 512):
     """stream_toks for a raw HF causal LM."""
-    past = None
+    past, eos = None, eos_ids(model, tokenizer)
     for _ in range(new_toks):
         out = model(toks, past_key_values=past, use_cache=True)
         past = out.past_key_values
         toks = t.multinomial(t.softmax(out.logits[0, -1].float(), dim=-1), num_samples=1).unsqueeze(0)
-        if toks.item() == tokenizer.eos_token_id:
+        if toks.item() in eos:
             break
         yield toks.item()
 
-def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:bool = False) -> list[list[int]]:
-    """n independent temperature-1 samples from one prompt [1, seq], generated as a batch; each row is returned cut before its first eos."""
-    eos = model.tokenizer.eos_token_id
+def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet: bool = False) -> list[list[int]]:
+    """n independent temperature-1 samples from one prompt [1, seq], generated as a batch; each row is returned cut before its first eos id (see eos_ids)."""
+    eos = t.tensor(sorted(eos_ids(model)), device=prompt_toks.device)
     toks = prompt_toks.repeat(n, 1)
     past = None
     gen = t.zeros(n, 0, dtype=t.long, device=prompt_toks.device)
@@ -37,15 +45,15 @@ def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:
         logits, past = model(toks, return_type="logits_and_cache", past_key_values=past, use_cache=True)
         toks = t.multinomial(t.softmax(logits[:, -1].float(), dim=-1), num_samples=1)
         gen = t.cat([gen, toks], dim=1)
-        ended = alive & (toks.squeeze(1) == eos)
+        ended = alive & t.isin(toks.squeeze(1), eos)
         lengths[ended] = step
         alive &= ~ended
         if not alive.any(): break
     return [gen[i, :lengths[i]].tolist() for i in range(n)]
 
 def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int) -> list[list[int]]:
-    """n independent temperature-1 samples from one prompt [1, seq] as a rolling batch: a row that ends (eos or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos."""
-    eos, last, plen = model.tokenizer.eos_token_id, prompt_toks[0, -1], prompt_toks.shape[1] - 1
+    """n independent temperature-1 samples from one prompt [1, seq] as a rolling batch: a row that ends (an eos id, see eos_ids, or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos."""
+    eos, last, plen = eos_ids(model), prompt_toks[0, -1], prompt_toks.shape[1] - 1
     B = min(batch_size, n)
     _, cache = model(prompt_toks[:, :-1].repeat(B, 1), return_type="logits_and_cache", use_cache=True)
     template = [(l.keys[0].clone(), l.values[0].clone()) if isinstance(l, DynamicLayer) else (l.conv_states[0][0].clone(), l.recurrent_states[0][0].clone()) for l in cache.layers]
@@ -64,10 +72,10 @@ def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
             row.append(tok)
         keep = []
         for i, row in enumerate(gen):
-            if row[-1] != eos and len(row) < new_toks:
+            if row[-1] not in eos and len(row) < new_toks:
                 keep.append(i)
                 continue
-            out.append(row[:-1] if row[-1] == eos else row)
+            out.append(row[:-1] if row[-1] in eos else row)
             bar.update()
             if n_started == n: continue
             n_started += 1
@@ -77,7 +85,8 @@ def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
                 else: layer.conv_states[0][i], layer.recurrent_states[0][i] = a, b
             toks[i], n_real[i], gen[i] = last, plen, []
         if len(keep) < len(gen):
-            cache.reorder_cache(t.tensor(keep, device=toks.device))
+            cache.reorder_cache(t.tensor(keep, dtype=t.long, device=toks.device))  # dtype: an empty keep would otherwise be a float tensor, which index_select rejects
             toks, n_real, gen = toks[keep], n_real[keep], [gen[i] for i in keep]
         t.cuda.empty_cache()
+    bar.close()
     return out

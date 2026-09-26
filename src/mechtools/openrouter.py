@@ -15,6 +15,7 @@ from tqdm import tqdm
 from mechtools.colors import *
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
+_sleep = asyncio.sleep  # the backoff sleep, replaceable in tests
 
 
 class RequestFailed(Exception):
@@ -41,12 +42,18 @@ _stats = Stats()
 
 
 def _verdict(status: int, body: dict, text: str) -> tuple[str | None, str]:
-    """(None, "") for a usable response, else the (cause, detail) to retry on. 401/402 raise RuntimeError (no key, out of credits: stop everything); any other 4xx raises RequestFailed (retrying will not help)."""
+    """(None, "") for a usable response, else the (cause, detail) to retry on. 401/402 raise RuntimeError (no key, out of credits: stop everything); any other 4xx raises RequestFailed (retrying will not help).
+    A 200 is usable when it has choices, its finish_reason is not "error", and usage carries completion_tokens and cost (usage accounting is requested on every call; a body without it cannot be billed or flattened)."""
     err, meta = body.get("error") or {}, (body.get("error") or {}).get("metadata") or {}
     detail = " | ".join(str(x) for x in (err.get("message"), meta.get("provider_name"), meta.get("raw"), meta.get("provider_error_code"), meta.get("limit_source")) if x) if err else text[:300]
     if status == 200 and body.get("choices"):
         choice = body["choices"][0]
-        return (None, "") if choice.get("finish_reason") != "error" else ("finish error", json.dumps(choice)[:300])  # the provider aborted mid-stream; its usage counts are wrong too
+        if choice.get("finish_reason") == "error":
+            return "finish error", json.dumps(choice)[:300]  # the provider aborted mid-stream; its usage counts are wrong too
+        usage = body.get("usage") or {}
+        if usage.get("completion_tokens") is None or usage.get("cost") is None:
+            return "no usage", json.dumps(body)[:300]
+        return None, ""
     if status == 200:
         return f"envelope {err.get('code')}", detail  # a 200 whose body is an error: upstream 429s and provider failures come back this way
     if status in (401, 402):
@@ -65,18 +72,21 @@ def _key() -> str:
 
 
 async def _post(client: httpx.AsyncClient, path: str, payload: dict, attempts: int, timeout: float) -> dict:
-    """POST payload to path and return the body. Retries with doubling backoff (1, 3, 7, ... s) on network errors, timeouts, 408/429/5xx, a 200 with no choices, and finish_reason "error"; the first failure of each kind is printed."""
+    """POST payload to path and return the body. Retries with doubling backoff (1, 3, 7, ... s) on network errors, timeouts, 408/429/5xx, a 200 with no choices, no usage or an unparsable body, and finish_reason "error"; the first failure of each kind is printed."""
     s, rid, headers = _stats, id(payload), {"Authorization": f"Bearer {_key()}"}
     for attempt in range(attempts):
         if attempt:
             s.sleeping += 1
-            await asyncio.sleep(2 ** attempt - 1)
+            await _sleep(2 ** attempt - 1)
             s.sleeping -= 1
         s.open[rid] = start = time.monotonic()
         try:
             r = await client.post(OPENROUTER_URL + path, json=payload, headers=headers, timeout=timeout)
-            body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
-            why, detail = _verdict(r.status_code, body, r.text)
+            try:
+                body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+            except ValueError:  # a truncated or non-JSON body under a JSON content type
+                body = None
+            why, detail = ("bad json", r.text[:300]) if body is None and r.status_code == 200 else _verdict(r.status_code, body or {}, r.text)
         except httpx.HTTPError as e:
             why, detail = "timeout" if isinstance(e, httpx.TimeoutException) else type(e).__name__, f"{type(e).__name__} {e}".strip()  # httpx timeouts stringify to nothing
         finally:
@@ -127,7 +137,7 @@ async def complete(prompt: str, model: str, provider: str | dict | None = None, 
 
 
 def flat(body: dict) -> dict:
-    """The common fields of either endpoint's body: text (message content, or the raw completion), reasoning, finish_reason, provider, model, prompt_tokens, completion_tokens, reasoning_tokens (wrong on many providers; count from text), cost (dollars). Store the body itself; it has more (reasoning_details with signatures, native_finish_reason, refusal, cache and cost breakdowns, the generation id)."""
+    """The common fields of either endpoint's body: text (message content, or the raw completion; None when the provider sent none), reasoning, finish_reason, provider, model, prompt_tokens, completion_tokens, reasoning_tokens (wrong on many providers; count from text), cost (dollars). Store the body itself; it has more (reasoning_details with signatures, native_finish_reason, refusal, cache and cost breakdowns, the generation id)."""
     choice, usage = body["choices"][0], body["usage"]
     msg = choice.get("message")  # chat bodies; a raw completion carries text and reasoning on the choice itself
     return {"text": msg["content"] if msg else choice["text"], "reasoning": (msg or choice).get("reasoning"), "finish_reason": choice.get("finish_reason"), "provider": body["provider"], "model": body["model"],

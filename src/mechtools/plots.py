@@ -4,34 +4,35 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import torch as t
-import umap
 from plotly.subplots import make_subplots
 from torch import Tensor
 
 def to_numpy(tensor):
     """
-    Helper function to convert a tensor to a numpy array. Also works on lists, tuples, and numpy arrays.
+    A numpy array from a tensor (detached, on cpu, bfloat16 upcast to float32), a numpy array or scalar, a Python scalar, or a list/tuple of any of those (lists of tensors included).
     """
     if isinstance(tensor, np.ndarray):
         return tensor
     elif isinstance(tensor, (list, tuple)):
-        array = np.array(tensor)
-        return array
-    elif isinstance(tensor, (t.Tensor, t.nn.parameter.Parameter)):
+        return np.array([to_numpy(v) if isinstance(v, (t.Tensor, list, tuple)) else v for v in tensor])
+    elif isinstance(tensor, t.Tensor):
         tensor = tensor.detach().cpu()
         return tensor.float().numpy() if tensor.dtype == t.bfloat16 else tensor.numpy()  # numpy has no bfloat16
-    elif isinstance(tensor, (int, float, bool, str)):
+    elif isinstance(tensor, (int, float, bool, str, np.generic)):
         return np.array(tensor)
     else:
         raise ValueError(f"Input to to_numpy has invalid type: {type(tensor)}")
 
+def is_scalar(v) -> bool:
+    return isinstance(v, (int, float, str, np.generic)) or (isinstance(v, (t.Tensor, np.ndarray)) and v.ndim == 0)
+
 def to_series(values):
     """
-    Normalize plot data to a 1D array, or to a list of 1D arrays if it holds several series.
+    Normalize plot data to a 1D array, or to a list of 1D arrays if it holds several series (a list of series, or a 2D array with one series per row). A list of scalars, numpy scalars or 0-d tensors is one series.
 
     Plotly express renames the series it's handed in place, so it needs a list of them rather than a 2D array.
     """
-    arr = [to_numpy(series) for series in values] if isinstance(values, list) and not isinstance(values[0], (int, float)) else to_numpy(values)
+    arr = [to_numpy(series) for series in values] if isinstance(values, (list, tuple)) and values and not is_scalar(values[0]) else to_numpy(values)
     return list(arr) if isinstance(arr, np.ndarray) and arr.ndim == 2 else arr
 
 
@@ -49,6 +50,20 @@ def margin_dict(margin: int | dict | None) -> dict:
     if margin is None:
         return {}
     return {"margin": dict.fromkeys("tblr", margin) if isinstance(margin, int) else margin}
+
+
+def wide_labels(labels: dict | None) -> dict | None:
+    """
+    The labels dict for a list of series: plotly express names those index (x), value (y) and variable (legend) rather than x and y, so the x and y labels are copied onto those keys.
+    """
+    if not labels:
+        return labels
+    out = dict(labels)
+    if "x" in labels:
+        out.setdefault("index", labels["x"])
+    if "y" in labels:
+        out.setdefault("value", labels["y"])
+    return out
 
 
 def imshow(
@@ -124,7 +139,7 @@ def imshow(
     )
     fig = px.imshow(arr, **px_kwargs).update_layout(**layout_kwargs, **margin_dict(margin))
     if facet_labels:
-        set_facet_labels(fig, facet_labels, facet_col_wrap)
+        set_facet_labels(fig, facet_labels)
     if border:
         fig.update_xaxes(showline=True, linewidth=1, linecolor='black', mirror=True)
         fig.update_yaxes(showline=True, linewidth=1, linecolor='black', mirror=True)
@@ -141,8 +156,8 @@ def imshow(
                 text = [text for _ in range(len(fig.data))]
         for i, _text in enumerate(text):
             fig.data[i].update(
-                text=_text, 
-                texttemplate="%{text}", 
+                text=_text,
+                texttemplate="%{text}",
                 textfont={"size": 12}
             )
     if xaxis_tickangle is not None:  # update_xaxes hits every facet, unlike update_layout(xaxis_...)
@@ -150,26 +165,14 @@ def imshow(
     return fig if return_fig else fig.show(renderer=renderer, config={"staticPlot": static})
 
 
-def reorder_list_in_plotly_way(L: list, col_wrap: int):
-    '''
-    Helper function, because Plotly orders figures in an annoying way when there's column wrap.
-    '''
-    L_new = []
-    while len(L) > 0:
-        L_new.extend(L[-col_wrap:])
-        L = L[:-col_wrap]
-    return L_new
-
-
-def set_facet_labels(fig, facet_labels: list[str], facet_col_wrap: int | None):
+def set_facet_labels(fig, facet_labels: list[str], facet_col_wrap: int | None = None):
     """
-    Rename the facet titles, undoing plotly's bottom-row-first ordering when the facets wrap.
+    Rename the facet titles in reading order (top row first, left to right), whatever order plotly stored them in: wrapped facets are stored bottom row first, so an offset that assumed full rows mislabelled a partial last row. facet_col_wrap is accepted for compatibility and not needed.
     """
-    assert len(facet_labels) <= len(fig.layout.annotations), f"got {len(facet_labels)} facet_labels but the figure has {len(fig.layout.annotations)} facet titles"
-    if facet_col_wrap is not None:
-        facet_labels = reorder_list_in_plotly_way(facet_labels, facet_col_wrap)
-    for i, label in enumerate(facet_labels):
-        fig.layout.annotations[i]['text'] = label
+    facets = [a for a in fig.layout.annotations if "=" in (a.text or "")]
+    assert len(facet_labels) <= len(facets), f"got {len(facet_labels)} facet_labels but the figure has {len(facets)} facet titles"
+    for a, label in zip(sorted(facets, key=lambda a: (-a.y, a.x)), facet_labels):
+        a.text = label
 
 
 def line(
@@ -201,8 +204,8 @@ def line(
     Args:
         y: 1D values to plot, or several series to plot as separate lines: either a list of 1D series or a 2D array with one line per row.
         renderer: plotly renderer to show with, e.g. "browser". None uses the default.
-        x: x values for the points, shared by every line. Defaults to 0, 1, 2, ... With use_secondary_yaxis, a pair of x arrays.
-        names: legend name per line, in order. Consumed as the traces are named, so pass a list you don't need afterwards.
+        x: x values for the points, shared by every line. Defaults to 0, 1, 2, ... With use_secondary_yaxis, one shared x array or a pair of x arrays.
+        names: legend name per line, in order.
         labels: axis names, e.g. {"x": "Layer", "y": "Loss"}. With use_secondary_yaxis, keys are "x", "y1", "y2".
         title: figure title.
         template: plotly theme, e.g. "simple_white".
@@ -236,19 +239,25 @@ def line(
         fig = make_subplots(specs=[[{"secondary_y": True}]]).update_layout(**layout)
         y0 = to_numpy(y[0])
         y1 = to_numpy(y[1])
-        x0, x1 = x if x is not None else [np.arange(len(y0)), np.arange(len(y1))]
+        if x is None:
+            x0, x1 = np.arange(len(y0)), np.arange(len(y1))
+        elif is_scalar(x[0]):  # one x for both lines
+            x0 = x1 = to_numpy(x)
+        else:
+            x0, x1 = x
         name0, name1 = names if names is not None else ["yaxis1", "yaxis2"]
         fig.add_trace(go.Scatter(y=y0, x=x0, name=name0), secondary_y=False)
         fig.add_trace(go.Scatter(y=y1, x=x1, name=name1), secondary_y=True)
     else:
         y = to_series(y)
         px_kwargs = drop_none(
-            x=x, labels=labels, title=title, template=template, height=height, width=width,
+            x=x, labels=wide_labels(labels) if isinstance(y, list) else labels, title=title, template=template, height=height, width=width,
             color=color, markers=markers, log_y=log_y, hover_name=hover_name,
         )
         fig = px.line(y=y, **px_kwargs).update_layout(**layout)
         if names is not None:
-            fig.for_each_trace(lambda trace: trace.update(name=names.pop(0)))
+            it = iter(names)
+            fig.for_each_trace(lambda trace: trace.update(name=next(it)))
     return fig if return_fig else fig.show(renderer=renderer)
 
 
@@ -319,13 +328,13 @@ def scatter(
             fig.add_trace(go.Scatter(mode='lines', x=xrange, y=xrange, showlegend=False))
         elif re.match("(x|y)=", add_line):
             try: c = float(add_line.split("=")[1])
-            except: raise ValueError(f"Unrecognized add_line: {add_line}. Please use either 'x=y' or 'x=c' or 'y=c' for some float c.")
+            except ValueError: raise ValueError(f"Unrecognized add_line: {add_line}. Please use either 'x=y' or 'x=c' or 'y=c' for some float c.")
             x, y = ([c, c], yrange) if add_line[0] == "x" else (xrange, [c, c])
             fig.add_trace(go.Scatter(mode='lines', x=x, y=y, showlegend=False))
         else:
             raise ValueError(f"Unrecognized add_line: {add_line}. Please use either 'x=y' or 'x=c' or 'y=c' for some float c.")
     if facet_labels:
-        set_facet_labels(fig, facet_labels, facet_col_wrap)
+        set_facet_labels(fig, facet_labels)
     if textposition is not None:
         fig.update_traces(textposition=textposition)
     return fig if return_fig else fig.show(renderer=renderer)
@@ -373,7 +382,7 @@ def bar(
     if size is not None:
         height, width = size
     px_kwargs = drop_none(
-        x=x, labels=labels, title=title, template=template, height=height, width=width,
+        x=x, labels=wide_labels(labels) if isinstance(arr, list) else labels, title=title, template=template, height=height, width=width,
         color=color, text_auto=text_auto,
     )
     fig = px.bar(y=arr, **px_kwargs).update_layout(hovermode=hovermode, **layout_kwargs, **margin_dict(margin))
@@ -415,7 +424,7 @@ def hist(
     Args:
         tensor: 1D values to bin, or several series to overlay: either a list of 1D series or a 2D array with one series per row.
         renderer: plotly renderer to show with, e.g. "browser". None uses the default.
-        names: legend name per series, in order. With a list of series it is consumed as the traces are named, so pass a list you don't need afterwards.
+        names: legend name per series, in order.
         labels: axis names, e.g. {"x": "Logit diff", "y": "Count"}.
         title: figure title.
         template: plotly theme, e.g. "simple_white".
@@ -453,8 +462,8 @@ def hist(
             layout["xaxis_title_text"] = labels.get("x", "")
             layout["yaxis_title_text"] = labels.get("y", "")
         fig = go.Figure(layout=go.Layout(**layout))
-        for x in arr:
-            fig.add_trace(go.Histogram(x=x, name=names.pop(0) if names is not None else None, nbinsx=nbins, opacity=opacity, histnorm=histnorm, bingroup="x"))  # bingroup makes the series share bin edges, like px.histogram does
+        for x, name in zip(arr, names if names is not None else [None] * len(arr)):
+            fig.add_trace(go.Histogram(x=x, name=name, nbinsx=nbins, opacity=opacity, histnorm=histnorm, bingroup="x"))  # bingroup makes the series share bin edges, like px.histogram does
     else:
         px_kwargs = drop_none(
             labels=labels, title=title, template=template, height=height, width=width,
@@ -470,15 +479,16 @@ def hist(
             fig.add_vline(x=series.mean(), line_width=3, line_dash="dash", line_color="black", annotation_text=f"Mean = {series.mean():.3f}", annotation_position="top")
     return fig if return_fig else fig.show(renderer=renderer, config={"staticPlot": static})
 
-def plot_vocab_umap(x: Tensor, labels: Tensor, tokenizer, n_points: int = 20_000, pca_dim: int = 128, seed: int = 0):
-    """UMAP of a random subset of token vectors x [vocab, d], colored by cluster, hover shows token and cluster id."""
+def plot_vocab_umap(x: Tensor, labels: Tensor, tokenizer, n_points: int = 20_000, pca_dim: int = 128, seed: int = 0, renderer=None, return_fig: bool = False):
+    """UMAP of a random subset of token vectors x [vocab, d], colored by cluster, hover shows token and cluster id. umap is imported here, on first use, since its numba compilation takes seconds."""
+    import umap
     idx = t.randperm(len(x), generator=t.Generator().manual_seed(seed))[:n_points]
     sub = x[idx].float()
-    sub = (sub @ t.pca_lowrank(sub, q=pca_dim)[2]).cpu().numpy()
+    sub = (sub @ t.pca_lowrank(sub, q=min(pca_dim, *sub.shape))[2]).cpu().numpy()
     emb = umap.UMAP(metric="cosine", random_state=seed).fit_transform(sub)
     lab = labels[idx].cpu().numpy()
     hover = [f"{tokenizer.decode([i])!r}<br>cluster {c}" for i, c in zip(idx.tolist(), lab.tolist())]
     fig = go.Figure(go.Scattergl(x=emb[:, 0], y=emb[:, 1], mode="markers", text=hover, hoverinfo="text",
                                  marker=dict(size=3, color=(lab * 0.618) % 1, colorscale="Phase", showscale=False)))
-    fig.update_layout(title=f"UMAP of {n_points} token vectors, {labels.max().item() + 1} clusters", width=1000, height=800, margin=dict(l=10, r=10, t=40, b=10))
-    fig.show()
+    fig.update_layout(title=f"UMAP of {len(idx)} token vectors, {labels.max().item() + 1} clusters", width=1000, height=800, margin=dict(l=10, r=10, t=40, b=10))
+    return fig if return_fig else fig.show(renderer=renderer)

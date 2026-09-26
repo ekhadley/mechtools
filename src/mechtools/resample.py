@@ -8,11 +8,10 @@ The model continues the CoT only if the provider feeds it exactly the rendered p
    Continuations arriving in text rather than reasoning mean the provider returns reasoning and response merged with the special tokens stripped (Together): set stop to the end-of-reasoning token and response_open to the string that opens the response block, and every rollout is two calls. Special tokens in returned text mean this provider does not strip them. Rosters change: on 2026-09-19 Qwen3.6-27B passed on Chutes and Phala and DeepSeek V4 Flash on Parasail and Mancer, while CoreWeave, which passed for both on 2026-09-02, no longer served either.
 3. Resample on the endpoint that produced the base rollouts, or accept that the curve measures the resampling endpoint's deployment: quantization (fp8, fp4, unlisted) and sampling defaults differ. Pass top_p=1.0 and top_k=0 explicitly: CoreWeave applied Qwen's generation_config (top_k 20, top_p 0.95) when they were omitted, Chutes and Phala did not; sampling_defaults measures this. seed is honored by some providers and ignored by others. Cross-provider curves agreed within Wilson intervals at S=50; base-rate differences below that resolution went undetected.
 4. max_tokens must cover reasoning plus response: Inkling traces exhausted 8192 and produced empty responses that looked like throttling. Such rollouts finish with "length", count as other, and are not retried. A few-hundred-token trace at S=50 stride 1 costs tens of dollars on a $2/M model, and a judge costs about as much as the subject on cheap ones.
-5. At run time every rollout checks prompt_tokens == n_prompt + t and raises otherwise, catching wrapping, re-tokenization, or a provider change mid-run; finish_reason "error" (a mid-stream abort whose usage is wrong too) is retried inside complete. In the project, check the base record against the same tokenizer: len(tokenizer(prompt)) == its prompt_tokens (plus a known constant, e.g. Inkling's appended block), and its completion_tokens minus the local tokens of reasoning + response equal to the provider's constant (1 or 2 for DeepSeek and Qwen: closing tag and EOS; 5 to 7 for Inkling), a larger gap being a truncated trace. usage reasoning_tokens is 0 or wrong on many providers: count from text.
-   Cuts inside a multi-byte character (byte-level BPE) do not retokenize and are skipped. Providers throttle in bursts (DeepInfra 429s independent of request rate, Together 503s above ~12 concurrent two-stage rollouts): keep concurrency at 12 to 32 and call fill again. Prompt logprobs and echo are unavailable on the raw endpoint, so prompt identity rests on counts plus the continuation check. Closed-lab models return summarized or encrypted reasoning and cannot be resampled."""
+5. At run time every rollout checks prompt_tokens == n_prompt + t (and a two-stage rollout's second call against the local count of its prompt) and raises otherwise, catching wrapping, re-tokenization, or a provider change mid-run; finish_reason "error" (a mid-stream abort whose usage is wrong too) is retried inside complete. In the project, check the base record against the same tokenizer: len(tokenizer(prompt)) == its prompt_tokens (plus a known constant, e.g. Inkling's appended block), and its completion_tokens minus the local tokens of reasoning + response equal to the provider's constant (1 or 2 for DeepSeek and Qwen: closing tag and EOS; 5 to 7 for Inkling), a larger gap being a truncated trace. usage reasoning_tokens is 0 or wrong on many providers: count from text.
+   Cuts inside a multi-byte character (byte-level BPE) do not retokenize and are skipped. Providers throttle in bursts (DeepInfra 429s independent of request rate, Together 503s above ~12 concurrent two-stage rollouts): keep concurrency at 12 to 32 and call fill again. A rollout whose judge fails is still saved, with judge_error instead of the verdict; judge_pending retries those. Prompt logprobs and echo are unavailable on the raw endpoint, so prompt identity rests on counts plus the continuation check. Closed-lab models return summarized or encrypted reasoning and cannot be resampled."""
 
 import asyncio
-import functools
 import json
 import os
 from collections import Counter
@@ -28,46 +27,91 @@ from mechtools.tables import show_table
 
 class Resampler:
     """Resamples text (a CoT, or a reasoning-off response) from token position t: the provider continues prompt + the first t tokens of text through raw /completions, so prompt must be the rendered chat template ending inside the open think or text block, and provider must pass raw prompts through verbatim: run probe first, and read the module docstring for the rest of the checklist. Each rollout checks prompt_tokens == n_prompt + t and raises otherwise.
-    Rollouts append to the jsonl at path, one per line: t, i, reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, raw (the response bodies, one per call), plus whatever judge(rollout) returns. response is the continuation only; when text is a response, the judge sees the whole thing as prefix(t) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them.
+    Rollouts append to the jsonl at path, one per line: t, i (unique per t), reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, raw (the response bodies, one per call), plus whatever judge(rollout) returns. response is the continuation only; when text is a response, the judge sees the whole thing as prefix(t) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them. A judge that raises does not lose the paid rollout: the record is saved with judge_error (a RequestFailed judge is swallowed, anything else propagates after saving), and judge_pending() judges those records later.
     A provider that returns reasoning and response merged (Together) needs stop at the end-of-reasoning token and response_open, the string that opens the response block: each rollout is then two calls. kw goes to complete: max_tokens (covering reasoning plus response), temperature, top_p and top_k (pass them explicitly), timeout, ...
     Which positions to sample and how many is up to the caller: fill({t: count}) tops up the deficit at each position, so a strided grid is one call and an adaptive scheme is a loop over fill and scores."""
 
     def __init__(self, tokenizer, prompt: str, text: str, path: str, model: str, provider: str, judge: Callable[[dict], Awaitable[dict]] | None = None, stop: str | None = None, response_open: str = "", **kw):
         self.tok, self.prompt, self.path, self.model, self.provider, self.judge, self.stop, self.response_open, self.kw = tokenizer, prompt, path, model, provider, judge, stop, response_open, kw
-        self.ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        self.n_prompt = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
-        self.rollouts = [json.loads(line) for line in open(path)] if os.path.exists(path) else []
+        self.ids = self.n_tokens(text, ids=True)
+        self.n_prompt = self.n_tokens(prompt)
+        self._prefixes: dict[int, str | None] = {}
+        self.rollouts = self._load()
         print(f"  {gray}prompt {self.n_prompt} tokens, text {len(self.ids)} tokens, {len(self.rollouts)} rollouts ({_usd(sum(r['cost'] for r in self.rollouts))}) on disk at {path}{endc}")
 
-    @functools.cache
+    def n_tokens(self, s: str, ids: bool = False) -> int | list[int]:
+        toks = self.tok(s, add_special_tokens=False)["input_ids"]
+        return toks if ids else len(toks)
+
+    def _load(self) -> list[dict]:
+        """The rollouts on disk. A truncated last line (a crash mid-write) is dropped from the file with a note; a bad line anywhere else raises."""
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path) as f:
+            lines = f.read().splitlines()
+        rollouts = []
+        for n, line in enumerate(lines, 1):
+            try:
+                rollouts.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                if n < len(lines):
+                    raise ValueError(f"{self.path} line {n} is not JSON: {e}") from e
+                print(f"  {yellow}dropping the truncated last line of {self.path}{endc}")
+                with open(self.path, "w") as f:
+                    f.write("".join(l + "\n" for l in lines[:-1]))
+        return rollouts
+
+    def _append(self, rec: dict):
+        with open(self.path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        self.rollouts.append(rec)
+
+    def _rewrite(self):
+        with open(self.path, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in self.rollouts))
+
     def prefix(self, t: int) -> str | None:
         """The first t tokens of text as a string, or None when that string does not retokenize to the same ids (a cut inside a multi-byte character)."""
-        s = self.tok.decode(self.ids[:t])
-        return s if self.tok(s, add_special_tokens=False)["input_ids"] == self.ids[:t] else None
+        if t not in self._prefixes:
+            s = self.tok.decode(self.ids[:t])
+            self._prefixes[t] = s if self.n_tokens(s, ids=True) == self.ids[:t] else None
+        return self._prefixes[t]
 
     def grid(self, stride: int) -> list[int]:
         """Every stride-th position plus 0 and the end."""
         return sorted(set(range(0, len(self.ids) + 1, stride)) | {len(self.ids)})
+
+    @staticmethod
+    def _check(t: int, stage: str, r: dict, expected: int):
+        if r["prompt_tokens"] != expected:
+            raise RuntimeError(f"t={t}{stage}: {r['provider']} counted {r['prompt_tokens']} prompt tokens, expected {expected}: it wrapped or re-tokenized the prefix")
 
     async def rollout(self, t: int, i: int, client: httpx.AsyncClient | None = None) -> dict:
         """One continuation from position t, judged, appended to the file and to self.rollouts. With response_open the response is sampled in a second call after the reasoning stops, and stays empty when the reasoning hit max_tokens."""
         prefix = self.prompt + (self.prefix(t) or "")
         body = await complete(prefix, self.model, self.provider, stop=self.stop, client=client, **self.kw)
         r = flat(body)
-        if r["prompt_tokens"] != self.n_prompt + t:
-            raise RuntimeError(f"t={t}: {r['provider']} counted {r['prompt_tokens']} prompt tokens, expected {self.n_prompt + t}: it wrapped or re-tokenized the prefix")
-        rec = {"t": t, "i": i, "reasoning": r["reasoning"], "response": r["text"], "finish_reason": r["finish_reason"], "provider": r["provider"], "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"], "cost": r["cost"], "raw": [body]}
+        self._check(t, "", r, self.n_prompt + t)
+        text = r["text"] or ""
+        rec = {"t": t, "i": i, "reasoning": r["reasoning"], "response": text, "finish_reason": r["finish_reason"], "provider": r["provider"], "prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"], "cost": r["cost"], "raw": [body]}
         if self.response_open:
-            rec |= {"reasoning": r["text"], "response": ""}
+            rec |= {"reasoning": text, "response": ""}
             if r["finish_reason"] == "stop":
-                body2 = await complete(prefix + r["text"] + self.response_open, self.model, self.provider, stop=self.stop, client=client, **self.kw)
+                prompt2 = prefix + text + self.response_open
+                body2 = await complete(prompt2, self.model, self.provider, stop=self.stop, client=client, **self.kw)
                 r2 = flat(body2)
-                rec |= {"response": r2["text"], "finish_reason": r2["finish_reason"], "completion_tokens": rec["completion_tokens"] + r2["completion_tokens"], "cost": rec["cost"] + r2["cost"], "raw": [body, body2]}
+                self._check(t, " stage 2", r2, self.n_tokens(prompt2))
+                rec |= {"response": r2["text"] or "", "finish_reason": r2["finish_reason"], "completion_tokens": rec["completion_tokens"] + r2["completion_tokens"], "cost": rec["cost"] + r2["cost"], "raw": [body, body2]}
         if self.judge:
-            rec |= await self.judge(rec)
-        with open(self.path, "a") as f:
-            f.write(json.dumps(rec) + "\n")
-        self.rollouts.append(rec)
+            try:
+                rec |= await self.judge(rec)
+            except Exception as e:
+                rec["judge_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+                self._append(rec)
+                if isinstance(e, RequestFailed):
+                    return rec
+                raise
+        self._append(rec)
         return rec
 
     async def fill(self, want: dict[int, int], concurrency: int = 32, desc: str = "resample") -> list[dict | None]:
@@ -76,7 +120,8 @@ class Resampler:
         if skipped:
             print(f"  {yellow}skipping {len(skipped)} positions whose prefix does not retokenize identically: {skipped[:20]}{endc}")
         done = Counter(r["t"] for r in self.rollouts)
-        todo = [(t, done[t] + k) for t in want if t not in skipped for k in range(want[t] - done[t])]
+        next_i = {t: max((r["i"] for r in self.rollouts if r["t"] == t), default=-1) + 1 for t in want}
+        todo = [(t, next_i[t] + k) for t in want if t not in skipped for k in range(want[t] - done[t])]
         est = f", ~{_usd(len(todo) * sum(r['cost'] for r in self.rollouts) / len(self.rollouts))} at the mean cost so far" if self.rollouts else ""
         print(f"  {gray}{len(todo)} rollouts to sample over {len(want) - len(skipped)} positions, {sum(done[t] for t in want)} already on disk{est}{endc}")
         if not todo:
@@ -85,10 +130,25 @@ class Resampler:
             recs = await gather_bar([self.rollout(t, i, client) for t, i in todo], concurrency, desc)
         if None in recs:
             print(f"  {yellow}{recs.count(None)} rollouts failed; call fill again to sample them{endc}")
+        if unjudged := sum("judge_error" in r for r in recs if r):
+            print(f"  {yellow}{unjudged} rollouts are saved without a verdict (judge_error); call judge_pending to judge them{endc}")
         return recs
 
+    async def judge_pending(self, concurrency: int = 32, desc: str = "judge") -> list[dict | None]:
+        """Runs the judge on the rollouts saved with judge_error and rewrites the file. Returns those records, None where the judge failed again."""
+        pending = [r for r in self.rollouts if "judge_error" in r]
+        async def one(r):
+            verdict = await self.judge(r)
+            del r["judge_error"]
+            r |= verdict
+            return r
+        try:
+            return await gather_bar([one(r) for r in pending], concurrency, desc)
+        finally:
+            self._rewrite()
+
     def scores(self, key: str = "match") -> list[dict]:
-        """Per position with rollouts, sorted by t: n rollouts, k with key True, judged (True or False), other (None or missing), p = k / judged, ci (Wilson), token (the one ending the prefix)."""
+        """Per position with rollouts, sorted by t: n rollouts, k with key True, judged (True or False), other (None or missing, including unjudged records), p = k / judged, ci (Wilson), token (the one ending the prefix)."""
         out = []
         for t in sorted({r["t"] for r in self.rollouts}):
             vals = [r.get(key) for r in self.rollouts if r["t"] == t]
@@ -102,7 +162,8 @@ PROBE_WS = "Okay.\t\tLet me see...\n\n\n\n17 * 23 = "  # tabs and blank lines: a
 
 async def _probe_one(tok, model: str, ep: dict, strings: list[str], samples: int, long: int, client: httpx.AsyncClient) -> dict:
     n = lambda s: len(tok(s or "", add_special_tokens=False)["input_ids"])
-    row = {"provider": ep["provider"], "quant": ep.get("quantization"), "$/M in,out": f"{float(ep['pricing']['prompt']) * 1e6:.2f}, {float(ep['pricing']['completion']) * 1e6:.2f}"}
+    pricing = ep.get("pricing") or {}
+    row = {"provider": ep["provider"], "quant": ep.get("quantization"), "$/M in,out": ", ".join(f"{float(pricing[k]) * 1e6:.2f}" if k in pricing else "?" for k in ("prompt", "completion"))}
     try:
         rs = [flat(await complete(s, model, ep["provider"], max_tokens=1, attempts=4, client=client)) for s in strings]
         row["offsets"] = [r["prompt_tokens"] - n(s) for r, s in zip(rs, strings)]

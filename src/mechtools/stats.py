@@ -29,7 +29,9 @@ def topk_vector_matches(vectors: Tensor, test_vector: Tensor, k: int = 10, norma
     return {"pos_indices": pos.indices, "pos_sims": pos.values, "neg_indices": neg.indices, "neg_sims": neg.values}
 
 def kmeans(x: Tensor, k: int, iters: int = 50, seed: int = 0) -> tuple[Tensor, Tensor]:
-    """Spherical k-means. x: [n, d]. Returns (labels [n], centroids [k, d])."""
+    """Spherical k-means from k random rows of x (Lloyd's iterations, no restarts, so a fixed seed is a fixed local optimum). x: [n, d]. Returns (labels [n], centroids [k, d]); a cluster that empties keeps a zero centroid."""
+    if k > len(x):
+        raise ValueError(f"k={k} clusters for {len(x)} points")
     x = normed(x.float())
     centroids = x[t.randperm(len(x), generator=t.Generator(device=x.device).manual_seed(seed), device=x.device)[:k]]
     for _ in trange(iters, desc="kmeans"):

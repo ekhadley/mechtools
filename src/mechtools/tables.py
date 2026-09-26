@@ -11,19 +11,26 @@ TABLE_CSS = "font-family:monospace;border-collapse:collapse;margin:4px 0"
 CELL_CSS = "padding:1px 10px;text-align:left;border-bottom:1px solid #8884"
 
 def html_table(headers: list[str], rows: list[tuple], title: str | None = None) -> str:
-    fmt = lambda c: f"{c:.4g}" if isinstance(c, float) else html.escape(str(c))
+    """Floats (and 0-d tensors) to 4 significant figures, everything else escaped str."""
+    def fmt(c):
+        c = c.item() if isinstance(c, Tensor) and c.ndim == 0 else c
+        return f"{c:.4g}" if isinstance(c, float) else html.escape(str(c))
     caption = f"<caption style='caption-side:top;font-weight:bold;text-align:left'>{html.escape(title)}</caption>" if title else ""
     head = "<tr>" + "".join(f"<th style='{CELL_CSS}'>{html.escape(h)}</th>" for h in headers) + "</tr>"
     body = "".join("<tr>" + "".join(f"<td style='{CELL_CSS}'>{fmt(c)}</td>" for c in row) + "</tr>" for row in rows)
     return f"<table style='{TABLE_CSS}'>{caption}{head}{body}</table>"
 
 def print_titled_table(table_str: str, title: str | None = None):
+    """Prints a tabulate table. A title goes into the top border of a rounded_outline table when it fits, else on its own line above the table."""
     if title is None:
         print(table_str)
         return
     lines = table_str.splitlines()
     inner = len(lines[0]) - 2
-    print(f"╭{'─' * inner}╮\n│{bold}{title.center(inner)}{endc}│\n├{'─' * inner}┤\n" + "\n".join(lines[1:]))
+    if lines[0].startswith("╭") and len(title) <= inner:
+        print(f"╭{'─' * inner}╮\n│{bold}{title.center(inner)}{endc}│\n├{'─' * inner}┤\n" + "\n".join(lines[1:]))
+    else:
+        print(f"{bold}{title}{endc}\n{table_str}")
 
 def show_table(headers: list[str], rows: list[tuple], title: str | None = None):
     """Rich HTML table in a notebook kernel, tabulate text table otherwise."""
@@ -33,7 +40,10 @@ def show_table(headers: list[str], rows: list[tuple], title: str | None = None):
         print_titled_table(tabulate(rows, headers=headers, tablefmt="rounded_outline"), title)
 
 def top_toks_table(logits: Tensor, tokenizer, k: int = 10, show_negative: bool = False, show_probs: bool = True, title: str | None = None, return_top: bool = False):
-    logits = logits.flatten().float()
+    """Table of the k most (and, with show_negative, least) likely tokens of one position's logits ([vocab], or with leading batch/position dims of size 1). return_top gives (top strs, top logits[, bottom strs, bottom logits])."""
+    logits = logits.squeeze().float()
+    if logits.ndim != 1:
+        raise ValueError(f"top_toks_table takes the logits of one position, got shape {tuple(logits.shape)}")
     probs = logits.softmax(-1)
     sides = [logits.topk(k, largest=largest) for largest in ([True, False] if show_negative else [True])]
     strs = [[repr(tokenizer.decode([i])) for i in side.indices.tolist()] for side in sides]

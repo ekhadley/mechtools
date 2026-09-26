@@ -32,4 +32,9 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.16.9",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["hf: loads a model or tokenizer from the local HF cache, and is skipped when it is absent"]
