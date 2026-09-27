@@ -126,6 +126,21 @@ def test_sample_rolling(n, bs, new_toks, p_eos, quiet, capsys):
     if p_eos == 0.0:
         assert all(len(r) == new_toks for r in out)
 
+def test_stream_rolling_yields_as_samples_finish():
+    full = FakeModel(p_eos=0.25, seed=3)
+    out = sample_rolling(full, PROMPT, n=7, batch_size=3, new_toks=10, quiet=True)
+    m = FakeModel(p_eos=0.25, seed=3)
+    g = stream_rolling(m, PROMPT, n=7, batch_size=3, new_toks=10, quiet=True)
+    assert m.calls == []  # nothing runs until consumed
+    first = next(g)
+    assert 0 < len(m.calls) < len(full.calls) and first == out[0]
+    assert [first, *g] == out and m.calls == full.calls
+
+def test_stream_rolling_closes_the_bar_when_abandoned(capsys):
+    for _ in stream_rolling(FakeModel(), PROMPT, n=7, batch_size=3, new_toks=10): break
+    err = capsys.readouterr().err
+    assert "sampling" in err and err.endswith("\n")  # the bar's close, run when the dropped generator exits its with block, ends the line
+
 @pytest.mark.hf
 def test_bridge_sampling(tiny_bridge):
     ids = t.tensor([tiny_bridge.tokenizer.encode("Hello there")])

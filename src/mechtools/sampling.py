@@ -54,8 +54,9 @@ def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:
         if not alive.any(): break
     return [row[:length] for row, length in zip(gen.tolist(), lengths.tolist())]
 
-def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int, quiet: bool = False) -> list[list[int]]:
-    """n independent temperature-1 samples from one prompt [1, seq] as a rolling batch: a row that ends (eos or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos (any id in eos_ids). quiet hides the progress bar."""
+def stream_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int, quiet: bool = False):
+    """Yield n independent temperature-1 samples from one prompt [1, seq] as each finishes, generated as a rolling batch: a row that ends (eos or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos (any id in eos_ids). quiet hides the progress bar.
+    Save each sample as it arrives and a crash or interrupt keeps everything that finished; another call with the remaining n tops up. Samples come in completion order, so a run stopped early lacks up to batch_size samples that skew long, the rows in flight. The body runs when consumed, not when called: hooks, seed and grad contexts must enclose the consuming loop, and a generator kept but not exhausted keeps the batch's cache on the device."""
     eos, last, plen = eos_ids(model), prompt_toks[0, -1], prompt_toks.shape[1] - 1
     B = min(batch_size, n)
     _, cache = model(prompt_toks[:, :-1].repeat(B, 1), return_type="logits_and_cache", use_cache=True)
@@ -63,33 +64,35 @@ def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
     toks = last.repeat(B, 1)  # next token fed to each row
     n_real = t.full((B,), plen, device=prompt_toks.device)  # unpadded cache entries per row, also the next token's position
     gen = [[] for _ in range(B)]
-    out, n_started = [], B
-    bar = pbar(total=n, desc="sampling", disable=quiet)
-    while gen:
-        S = cache.get_seq_length()
-        mask = (t.arange(S + 1, device=toks.device) >= (S - n_real)[:, None]).long()
-        logits, cache = model(toks, return_type="logits_and_cache", past_key_values=cache, use_cache=True, attention_mask=mask, position_ids=n_real[:, None])
-        toks = t.multinomial(t.softmax(logits[:, -1].float(), dim=-1), num_samples=1)
-        n_real += 1
-        for row, tok in zip(gen, toks.squeeze(1).tolist()):
-            row.append(tok)
-        keep = []
-        for i, row in enumerate(gen):
-            if row[-1] not in eos and len(row) < new_toks:
+    n_started = B
+    with pbar(total=n, desc="sampling", disable=quiet) as bar:
+        while gen:
+            S = cache.get_seq_length()
+            mask = (t.arange(S + 1, device=toks.device) >= (S - n_real)[:, None]).long()
+            logits, cache = model(toks, return_type="logits_and_cache", past_key_values=cache, use_cache=True, attention_mask=mask, position_ids=n_real[:, None])
+            toks = t.multinomial(t.softmax(logits[:, -1].float(), dim=-1), num_samples=1)
+            n_real += 1
+            for row, tok in zip(gen, toks.squeeze(1).tolist()):
+                row.append(tok)
+            keep = []
+            for i, row in enumerate(gen):
+                if row[-1] not in eos and len(row) < new_toks:
+                    keep.append(i)
+                    continue
+                yield row[:-1] if row[-1] in eos else row
+                bar.update()
+                if n_started == n: continue
+                n_started += 1
                 keep.append(i)
-                continue
-            out.append(row[:-1] if row[-1] in eos else row)
-            bar.update()
-            if n_started == n: continue
-            n_started += 1
-            keep.append(i)
-            for layer, (a, b) in zip(cache.layers, template):  # entries left of the prompt are stale but masked
-                if isinstance(layer, DynamicLayer): layer.keys[i, :, S + 1 - plen:], layer.values[i, :, S + 1 - plen:] = a, b
-                else: layer.conv_states[0][i], layer.recurrent_states[0][i] = a, b
-            toks[i], n_real[i], gen[i] = last, plen, []
-        if len(keep) < len(gen):
-            cache.reorder_cache(t.tensor(keep, dtype=t.long, device=toks.device))  # dtype: an empty keep, when the batch's last rows end together, would otherwise be float
-            toks, n_real, gen = toks[keep], n_real[keep], [gen[i] for i in keep]
-        t.cuda.empty_cache()
-    bar.close()
-    return out
+                for layer, (a, b) in zip(cache.layers, template):  # entries left of the prompt are stale but masked
+                    if isinstance(layer, DynamicLayer): layer.keys[i, :, S + 1 - plen:], layer.values[i, :, S + 1 - plen:] = a, b
+                    else: layer.conv_states[0][i], layer.recurrent_states[0][i] = a, b
+                toks[i], n_real[i], gen[i] = last, plen, []
+            if len(keep) < len(gen):
+                cache.reorder_cache(t.tensor(keep, dtype=t.long, device=toks.device))  # dtype: an empty keep, when the batch's last rows end together, would otherwise be float
+                toks, n_real, gen = toks[keep], n_real[keep], [gen[i] for i in keep]
+            t.cuda.empty_cache()
+
+def sample_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int, quiet: bool = False) -> list[list[int]]:
+    """list(stream_rolling(...)): all n samples once the last has finished."""
+    return list(stream_rolling(model, prompt_toks, n, batch_size, new_toks, quiet))
