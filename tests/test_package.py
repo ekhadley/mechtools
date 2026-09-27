@@ -37,7 +37,7 @@ def test_star_import_has_no_collisions():
 def test_readme_layout_names_exist():
     """Every backticked identifier in the README's Layout table names something in the package (a function, class, method or parameter), so renames update the docs."""
     layout = README.read_text().split("## Layout")[1].split("\n## ")[0]
-    prose = {"HookedTransformer", "TransformerBridge", "text", "finish_reason", "prompt_tokens", "raw", "cfg", "reasoning_content", "error"}  # classes from other packages, fields of flat records and messages, a finish_reason value
+    prose = {"HookedTransformer", "TransformerBridge", "text", "reasoning", "response", "finish_reason", "prompt_tokens", "completion_tokens", "cost", "raw", "cfg", "reasoning_content", "error"}  # classes from other packages, fields of flat and rollout records and messages, a finish_reason value
     for row in re.findall(r"^\| `(\w+)` \| (.*) \|$", layout, flags=re.M):
         mod = importlib.import_module(f"mechtools.{row[0]}")
         names = public(mod)

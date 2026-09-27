@@ -133,7 +133,7 @@ def _pin(provider: str | dict) -> dict:
 async def chat(conv: str | list[dict], model: str, provider: str | dict | None = None, reasoning: bool | str | dict | None = None, max_tokens: int = 8192, temperature: float = 1.0,
                attempts: int = 6, timeout: float = 600, client: httpx.AsyncClient | None = None, **body) -> dict:
     """One /chat/completions call: the response body as OpenRouter sent it (store that; flat pulls the common fields). A str conv is a single user turn. provider pins one endpoint by slug (a dict passes through as OpenRouter's provider object).
-    reasoning True/False sets enabled, a str sets effort, a dict passes through. body passes through: top_p, top_k, seed, stop, logprobs, response_format, ..."""
+    reasoning True/False sets enabled, a str sets effort, a dict passes through. transforms=[] keeps OpenRouter from compressing the prompt. body passes through: top_p, top_k, seed, stop, logprobs, response_format, ..."""
     payload = {"model": model, "messages": [{"role": "user", "content": conv}] if isinstance(conv, str) else conv, "max_tokens": max_tokens, "temperature": temperature, "transforms": [], "usage": {"include": True}, **body}
     if provider: payload["provider"] = _pin(provider)
     if reasoning is not None: payload["reasoning"] = {"enabled": reasoning} if isinstance(reasoning, bool) else {"effort": reasoning} if isinstance(reasoning, str) else reasoning
@@ -142,7 +142,7 @@ async def chat(conv: str | list[dict], model: str, provider: str | dict | None =
 
 async def complete(prompt: str, model: str, provider: str | dict | None = None, max_tokens: int = 8192, temperature: float = 1.0, stop: str | list[str] | None = None,
                    attempts: int = 6, timeout: float = 600, client: httpx.AsyncClient | None = None, **body) -> dict:
-    """One raw /completions call on a self-rendered prompt string, returning the response body, e.g. a chat template ending inside an open think block. transforms=[] keeps OpenRouter from compressing the prompt; whether the provider passes it through verbatim shows in prompt_tokens."""
+    """One raw /completions call on a self-rendered prompt string (e.g. a chat template ending inside an open think block), returning the response body. transforms=[] keeps OpenRouter from compressing the prompt; whether the provider passes it through verbatim shows in prompt_tokens."""
     payload = {"model": model, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature, "transforms": [], "usage": {"include": True}, **body}
     if provider: payload["provider"] = _pin(provider)
     if stop: payload["stop"] = [stop] if isinstance(stop, str) else stop
@@ -158,8 +158,8 @@ def flat(body: dict) -> dict:
 
 
 async def gather_bar(coros: list, concurrency: int = 32, desc: str = "", swallow: tuple[type[Exception], ...] = (RequestFailed,), abort_after: int | None = 8) -> list:
-    """Awaits coros at most concurrency at a time under a progress bar; results in order. A coro that raises one of swallow yields None, counted by cause with the first of each kind printed above the bar; any other exception cancels the rest and propagates.
-    abort_after: once that many coroutines have failed before any succeeded, the batch is failing systematically (a bad model, provider or parameter, or an endpoint that is down) and a RuntimeError stops it instead of running every coroutine to None; None disables the check. Failures after a success stay per-request Nones.
+    """Awaits coros at most concurrency at a time under a progress bar; results in order. A coro that raises one of swallow yields None, counted by cause with the first of each kind printed above the bar; any other exception (including the 401/402 RuntimeError) cancels the rest and propagates wrapped in an ExceptionGroup, since the coros run under an asyncio.TaskGroup: catch it with except*.
+    abort_after: once that many coroutines have failed before any succeeded, the batch is failing systematically (a bad model, provider or parameter, or an endpoint that is down) and a RuntimeError, also inside an ExceptionGroup, stops it instead of running every coroutine to None; None disables the check. Failures after a success stay per-request Nones.
     The status line: coroutines ok/fail, dollars spent < the projected total for the whole run (mean cost per finished coroutine, failures included, times len(coros)), open requests and the age of the oldest (slow models show here, not as errors), mean seconds per successful request, requests sleeping in backoff, finish reasons other than stop (length = truncated), failed attempts by cause (429, 503, timeout, envelope 429, finish error, ...). tqdm clips it to the terminal width; the summary printed at the end has everything."""
     global _stats
     _stats = s = Stats()

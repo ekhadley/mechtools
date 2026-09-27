@@ -167,7 +167,7 @@ def imshow(
 
 def set_facet_labels(fig, facet_labels: list[str], facet_col_wrap: int | None = None):
     """
-    Rename the facet titles in reading order (top row first, left to right), whatever order plotly stored them in: wrapped facets are stored bottom row first, so an offset that assumed full rows mislabelled a partial last row. facet_col_wrap is accepted for compatibility and not needed.
+    Rename the facet titles in reading order (top row first, left to right), whatever order plotly stored them in (wrapped facets are stored bottom row first). facet_col_wrap is unused: the order comes from the titles' positions.
     """
     facets = [a for a in fig.layout.annotations if "=" in (a.text or "")]
     assert len(facet_labels) <= len(facets), f"got {len(facet_labels)} facet_labels but the figure has {len(facets)} facet titles"
@@ -217,7 +217,7 @@ def line(
         hover_name: label shown in bold in each point's hover box.
         xaxis_tickvals: tick labels for the x axis, placed at `x` (or at 0, 1, 2, ...).
         use_secondary_yaxis: plot y[0] against a left axis and y[1] against a right one, for series of different scales.
-        hovermode: plotly hover behaviour. Defaults to one shared box for all lines at that x.
+        hovermode: plotly hover behaviour. Defaults to "closest", the nearest point only; "x unified" shows one shared box for all lines at that x.
         margin: padding in pixels. An int sets all four sides.
         return_fig: return the figure instead of showing it.
     """

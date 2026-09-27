@@ -53,7 +53,7 @@ def pick_sentinel(tokenizer, used_ids: set[int]) -> str:
 
 def get_turn_tok_idx(conversation: list[dict], turn: int, tokenizer, idx_point: str = "start", sentinel: str | None = None, **chat_kwargs) -> int | tuple[int, int]:
     """Index of the first token holding conversation[turn]'s content ("start"), the index after the last ("end"), or both, in to_ids(conversation, tokenizer, **chat_kwargs).
-    Compares against a rendering with the content replaced by a sentinel token, so tokens that merge template text with content count as content, and the span is what the template rendered from the content field: on Qwen3, a reasoning_content field renders as template text outside the span, an earlier turn's <think> block inside content is stripped by the template, and the last turn's is kept in the span."""
+    Compares against a rendering with the content replaced by a sentinel token, so tokens that merge template text with content count as content, and the span is what the template rendered from the content field: on Qwen3, a reasoning_content field renders as template text outside the span, an earlier turn's <think> block inside content is stripped by the template, and the last turn's is in the span from after its opening <think> tag, which stays template text."""
     ids = to_ids(conversation, tokenizer, **chat_kwargs)
     conv = copy.deepcopy(conversation)
     conv[turn]["content"] = sentinel or pick_sentinel(tokenizer, set(ids))

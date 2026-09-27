@@ -125,7 +125,7 @@ def tabbed(panes: dict[str, str] | dict[str, dict[str, str]], head: str = "", ba
 
 def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = True, title: str | None = None, input_src=None, pos: int = -1, ctx: int = 32, n_cols: int = 4, tokenizer=None):
     """One table per entry of `scores` ({header: [n] logits or scores}) listing its top-k items (k clipped to n). softmax=True shows probs, else raw scores.
-    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of pos, the one at pos underlined."""
+    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of pos, the one at pos underlined; a string is tokenized with special tokens added, so pass a self-rendered template string as ids."""
     name = names.__getitem__ if isinstance(names, list) else names
     tables = []
     for header, s in scores.items():
@@ -235,12 +235,12 @@ def cluster_readout(scores: dict[str, Tensor] | dict[str, dict[int, Tensor]], la
     return shown if nested else {label: v[pos] for label, v in shown.items()}
 
 def jlens_cluster_readout(cache, layers, pos: int | list[int], model, jlens: dict, labels: Tensor, n_clusters: int = 11, n_rows: int = 10, hook: str = "hook_resid_pre", input_src=None, title: str = "j-lens cluster readout", ctx: int = 32, n_cols: int = 4) -> dict:
-    """Tabbed j-lens cluster readout, one tab per layer and, if pos is a list, a second bar of tabs per position. labels is a clustering of the vocab, e.g. kmeans over the mean-centered model.W_U.T."""
+    """Tabbed j-lens cluster readout, one tab per layer and, if pos is a list, a second bar of tabs per position. labels is a clustering of the vocab, e.g. cluster_vocab(model)[0]."""
     scores = {f"L{layer}": per_pos(lambda p: get_lens_logits(cache[f"blocks.{layer}.{hook}"][0, p], layer, model, jlens), pos) for layer in layers}
     return cluster_readout(scores, labels, model.tokenizer.decode, n_clusters, n_rows, n_cols, title, input_src, pos, ctx, True, model.tokenizer)
 
 def tlens_cluster_readout(cache, layers, pos: int | list[int], tlens: dict, k: int = 256, seed: int = 0, n_clusters: int = 11, n_rows: int = 10, hook: str = "hook_resid_pre", input_src=None, title: str = "template-lens cluster readout", ctx: int = 32, n_cols: int = 4, tokenizer=None) -> dict:
-    """Tabbed template-lens cluster readout, one tab per layer and, if pos is a list, a second bar of tabs per position. Each layer's templates are clustered by cluster_tlens(tlens, layer, k, seed=seed)."""
+    """Tabbed template-lens cluster readout, one tab per layer and, if pos is a list, a second bar of tabs per position. Each layer's templates are clustered by cluster_tlens(tlens, layer, k, seed=seed) on every call, so k is the number of clusters, not rows (n_rows is the rows per table)."""
     scores = {f"L{layer}": per_pos(lambda p: get_tlens_scores(cache[f"blocks.{layer}.{hook}"][0, p], layer, tlens), pos) for layer in layers}
     labels = {f"L{layer}": cluster_tlens(tlens, layer, k, seed=seed)[0] for layer in layers}
     return cluster_readout(scores, labels, tlens["words"], n_clusters, n_rows, n_cols, title, input_src, pos, ctx, False, tokenizer)

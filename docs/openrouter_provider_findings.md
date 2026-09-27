@@ -1,6 +1,8 @@
 # OpenRouter provider findings for CoT resampling (from the weirdchat project)
 
-Compiled 2026-09-13 from the weirdchat repo (`utils.py`, the three `*_resample.py` configs, `run.py`), the project memory files, and the Claude Code session transcripts of the probe sessions (2026-09-02/03 for DeepSeek V4 Flash and Qwen3.6-27B, 2026-09-03 for Inkling) plus a sweep of every other session in the project. Everything here was measured on those dates. OpenRouter's provider roster, templates, and defaults change; re-run the cheap checks in section 12 before trusting a provider in a new run.
+Compiled 2026-09-13 from the weirdchat repo (`utils.py`, the three `*_resample.py` configs, `run.py`), the project memory files, and the Claude Code session transcripts of the probe sessions (2026-09-02/03 for DeepSeek V4 Flash and Qwen3.6-27B, 2026-09-03 for Inkling) plus a sweep of every other session in the project. Everything here was measured on those dates. OpenRouter's provider roster, templates, and defaults change; re-run the cheap checks in section 12 (or `mechtools.resample.probe`) before trusting a provider in a new run. A probe on 2026-09-19 found CoreWeave no longer serving DeepSeek V4 Flash or Qwen3.6-27B; Qwen3.6-27B passed on Chutes and Phala, DeepSeek V4 Flash on Parasail and Mancer.
+
+"The resampler" in this file is weirdchat's (`utils._resample`): its file format, `cut=` mode, `scores.json`, and base-record assertions (sections 6 and 11) are not `mechtools.resample.Resampler`'s, which is documented in its own docstrings.
 
 Models: `deepseek/deepseek-v4-flash`, `qwen/qwen3.6-27b`, `thinkingmachines/inkling` (resampled), and `qwen/qwen3.6-35b-a3b`, `qwen/qwen3-8b`, `google/gemma-4-31b-it`, `nvidia/nemotron-3-ultra-550b-a55b` (replay only, lighter findings).
 

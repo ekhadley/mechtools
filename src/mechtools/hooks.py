@@ -61,7 +61,7 @@ def set_hook(resid: Tensor, hook, Q: Tensor, v: Tensor) -> Tensor:
     return resid - (resid @ Q) @ Q.T + v
 
 def set_hooks(dirs_by_layer: dict[int, Tensor], target: float, hook_fmt: str = "blocks.{}.hook_resid_pre") -> list[tuple[str, Callable]]:
-    """fwd_hooks that replace the residual's projection onto span(dirs) with the in-span vector whose dot product with each unit direction is `target`. `dirs` is [r, d] or a single [d] direction."""
+    """fwd_hooks that replace the residual's projection onto span(dirs) with the in-span vector whose dot product with each unit direction is `target` (the least-squares vector, by pinv, when no vector satisfies all of them, e.g. for opposite directions). `dirs` is [r, d] or a single [d] direction."""
     hooks = []
     for layer, dirs in dirs_by_layer.items():
         D = t.atleast_2d(dirs.float())
