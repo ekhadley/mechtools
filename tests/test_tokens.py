@@ -69,6 +69,13 @@ def test_toks_html():
     assert h.count("<span data-p=") == 2 and "<span data-p=0 title='3" in h and "<span data-p=1 title='6" in h and "border-bottom:2px solid #e66" not in h
     assert "<span" not in toks_html([], pos=-1) and "<span" not in toks_html([], pos=[0])  # no tokens: no crash
 
+def test_toks_html_vals():
+    h = toks_html(["a", "b", "c"], vals=t.tensor([[1.0, -0.5, 0.0]]), val_name="attr")
+    assert "rgba(230,80,80,1.000)" in h and "rgba(80,130,230,0.500)" in h and "rgba(230,80,80,0.000)" in h and "&middot; attr -0.5'" in h
+    assert toks_html(["a", "b"], vals=[0, 0]).count("rgba(230,80,80,0.000)") == 2  # all-zero values: no division by zero, fully transparent shade
+    with pytest.raises(ValueError, match="2 values for 3 tokens"):
+        toks_html(["a", "b", "c"], vals=[1, 2])
+
 def test_underline_stoks():
     s = underline_stoks([1, 2, 3], FakeTok())
     assert s == f"{endc}<1>{underline}<2>{endc}<3>{endc}"

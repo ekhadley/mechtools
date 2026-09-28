@@ -26,19 +26,29 @@ def to_str_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, add_speci
 
 TOKS_CSS = "<style>.tk{cursor:default} .tk span:hover{outline:1px solid #e66} .tk span[data-p]{cursor:pointer;border-bottom:2px solid #666} .tk span[data-p].on{border-bottom-color:#e66;background:#503a3a !important}</style>"
 
-def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | list[int] | None = None, lo: int = 0, hi: int | None = None) -> str:
-    """strs[lo:hi] as spans with alternating backgrounds, hover showing index, id (if given) and repr of the string. An int `pos` underlines that token; a list of positions marks each one as a clickable tab target (data-p is its index in the list; the enclosing widget gives the selected one class 'on'). Put it inside a dark monospace container."""
+def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | list[int] | None = None, lo: int = 0, hi: int | None = None, vals: list[float] | Tensor | None = None, val_name: str = "value") -> str:
+    """strs[lo:hi] as spans with alternating backgrounds, hover showing index, id (if given) and repr of the string. An int `pos` underlines that token; a list of positions marks each one as a clickable tab target (data-p is its index in the list; the enclosing widget gives the selected one class 'on').
+    `vals`, one scalar per token, shades each token by its value: red for positive, blue for negative, opacity |v| / max|v|; the hover then also shows `val_name` and the value. Put it inside a dark monospace container."""
     hi = len(strs) if hi is None else hi
     sel = [p % len(strs) for p in ([] if pos is None else [pos] if isinstance(pos, int) else pos)] if strs else []
     tabs = {p: j for j, p in enumerate(sel)} if isinstance(pos, list) else {}
-    spans = "".join(f"<span {f'data-p={tabs[i]} ' if i in tabs else ''}title='{i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}' style='background:{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i in sel and not tabs else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
+    vals = None if vals is None else t.as_tensor(vals).flatten().float().tolist()
+    if vals is not None and len(vals) != len(strs):
+        raise ValueError(f"{len(vals)} values for {len(strs)} tokens")
+    scale = max((abs(v) for v in vals), default=0) or 1 if vals else 1
+    shade = lambda i: f"linear-gradient(rgba({'230,80,80' if vals[i] >= 0 else '80,130,230'},{abs(vals[i]) / scale:.3f}),rgba(0,0,0,0))," if vals else ""
+    spans = "".join(f"<span {f'data-p={tabs[i]} ' if i in tabs else ''}title='{i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}{f' &middot; {html.escape(val_name)} {vals[i]:.4g}' if vals else ''}' style='background:{shade(i)}{'#3c3c3c' if i % 2 else '#262626'};{'border-bottom:2px solid #e66' if i in sel and not tabs else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
     return f"{TOKS_CSS}<div class='tk' style='white-space:pre-wrap;line-height:1.8'>{'… ' if lo > 0 else ''}{spans}{' …' if hi < len(strs) else ''}</div>"
 
-def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, add_special_tokens: bool = True, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
+def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, vals: list[float] | Tensor | None = None, val_name: str = "value", title: str | None = None, add_special_tokens: bool = True, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
     """Rich HTML display of a prompt's tokens, hover shows index, token id and repr, the token at pos (if given) underlined.
+    `vals`, one scalar per token (list or tensor of shape [seq] or [1, seq]), shades each token by its value (red positive, blue negative, opacity relative to max |v|), names it `val_name` in the hover, and puts the value range in the header line with `title`.
     add_special_tokens applies to a string (see to_ids). A conversation (list of role/content dicts) goes through apply_chat_template; the chat kwargs and any template_kwargs (e.g. enable_thinking=False for Qwen3) are forwarded to it."""
     ids = to_ids(inp, tokenizer, add_special_tokens, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message, tools=tools, chat_template=chat_template, **template_kwargs)
-    display(HTML(f"<div style='background:#111;color:#ddd;font:12px monospace;padding:8px'>{toks_html([tokenizer.decode(i) for i in ids], ids, pos)}</div>"))
+    strip = toks_html([tokenizer.decode(i) for i in ids], ids, pos, vals=vals, val_name=val_name)
+    rng = f"<span style='color:#888;font-weight:normal'>{html.escape(val_name)} &isin; [{t.as_tensor(vals).min():.3g}, {t.as_tensor(vals).max():.3g}]</span>" if vals is not None else ""
+    head = f"<div style='margin-bottom:6px;font-weight:bold'>{html.escape(title) if title else ''}{' &middot; ' if title and rng else ''}{rng}</div>" if title or rng else ""
+    display(HTML(f"<div style='background:#111;color:#ddd;font:12px monospace;padding:8px'>{head}{strip}</div>"))
 
 def underline_stoks(toks: str | Tensor | list[int], tokenizer) -> str:
     """The tokens of `toks` as one terminal string with every other token underlined, to see the boundaries."""
