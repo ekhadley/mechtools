@@ -1,6 +1,6 @@
 # mechtools
 
-Shared helpers for mechinterp research projects.
+Shared helpers for mechinterp research: tokenization and chat-template utilities, local sampling, steering hooks, lens readouts rendered as HTML in the notebook, async OpenRouter batching, chain-of-thought resampling, and plotly wrappers. Models are `TransformerBridge` objects from transformer-lens 3.
 
 ## Install
 
@@ -12,7 +12,164 @@ uv add git+https://github.com/ekhadley/mechtools
 
 or, from a local clone, `uv add --editable path/to/mechtools`.
 
-Then `from mechtools import *` at the top of a script gives the whole prelude: color constants, `tec`, `set_seed`, `pbar` (tqdm with colored desc, `ncols=120`, ascii fill), and everything below. Importing also turns on IPython autoreload when in a kernel and loads the first `.env` found walking up from the current directory, the project's when run from the project directory; that is where `OPENROUTER_API_KEY` goes. Import succeeds without a key; the first OpenRouter request then raises a `RuntimeError` naming the `.env` that was loaded, or the cwd when none was found. A variable already set in the environment keeps its value, so a shell export or a command-line `VAR=...` wins over the file, and when its value differs from the file's, import prints a note naming it.
+Then:
+
+```python
+from mechtools import *
+```
+
+This imports every module's public names plus the prelude: terminal color constants, `pbar` (tqdm in the house style), `set_seed`, and `tec` (empties the CUDA cache). Inside an IPython kernel it also turns on autoreload. It loads the first `.env` found walking up from the current directory, which is where `OPENROUTER_API_KEY` goes; import succeeds without one, and the first OpenRouter request tells you which `.env` was loaded if the key is missing.
+
+## Quick tour
+
+```python
+from mechtools import *
+
+model = load_bridge("Qwen/Qwen3-0.6B")      # TransformerBridge, eval mode, grads off; peft adapter repos are merged automatically
+tok = model.tokenizer
+conv = [{"role": "user", "content": "What is 17 * 23?"}]
+
+show_toks(conv, tok, add_generation_prompt=True, enable_thinking=False)      # hoverable token strip
+ids, attn = apply_chat_template(tok, conv, enable_thinking=False)            # left-padded [batch, seq]
+print(tok.decode(list(stream_toks(model, ids, new_toks=64))))                # sample until eos
+
+show_logits(conv, model=model, k=10)        # click any token to see the top-k predictions after it
+```
+
+## Modules
+
+### `tokens`
+
+Every function takes the same kinds of input: a string, a sequence of token ids, or a conversation (a list of role/content dicts, rendered through the tokenizer's chat template). Chat-template kwargs like `add_generation_prompt` or `enable_thinking` are forwarded.
+
+- `to_ids`, `to_str_toks`: ids or decoded strings of any input.
+- `show_toks`: HTML token strip. Hover shows index, id and repr. `pos` underlines one token. `vals=` shades each token by a scalar (red positive, blue negative), for attributions or probe scores along a sequence.
+- `underline_stoks`: the same boundaries in the terminal, alternating underline.
+- `apply_chat_template`: a left-padded `(input_ids, attention_mask)` batch from a list of conversations or plain prompt strings.
+- `get_turn_tok_idx`: token span of one message's content inside the rendered conversation.
+- `get_assistant_mask`: `(input_ids, attention_mask, assistant_mask)` where the mask is 1 on the tokens an SFT loss should predict, the content of every assistant turn plus its end-of-turn token.
+- `completion_loss`: mean cross-entropy over the masked tokens.
+
+```python
+convs = [[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}], ...]
+ids, attn, mask = get_assistant_mask(tok, convs)
+loss = completion_loss(model(ids), ids, mask)
+```
+
+Tested against the Qwen3, Qwen2.5, gemma-3, Llama-3 and Starling templates. When you pass a string you rendered yourself from a chat template, pass `add_special_tokens=False` so BOS is not added twice.
+
+### `sampling`
+
+Temperature-1 sampling from a `TransformerBridge` (or a raw HF model with `stream_toks_hf`). Everything stops at any of the model's end-of-sequence ids, which are read from both the generation config and the tokenizer, since chat models often end a turn with a token that is not the tokenizer's eos.
+
+- `stream_toks`: yields one token id at a time.
+- `sample_batch`: `n` independent samples of one prompt as a single batch.
+- `stream_rolling` / `sample_rolling`: `n` samples with a fixed batch size, yielding each as it finishes and refilling its slot. Use this for large `n`; a run that saves each sample as it arrives survives a crash, and calling again with the remaining `n` tops it up.
+
+```python
+for sample in stream_rolling(model, ids, n=2000, batch_size=64, new_toks=512):
+    out.write(json.dumps(tok.decode(sample)) + "\n")
+```
+
+A returned sample of length `new_toks` hit the cap without stopping.
+
+### `hooks`
+
+Hook functions for `model.hooks(fwd_hooks=...)` and `model.run_with_hooks`.
+
+- `add_bias_hook` / `make_add_bias_hook`: add a vector, optionally scaled, rescaled to a `target_norm`, or only at `seq_pos`.
+- `replace_act_hook`: overwrite the activation, or the positions in `seq_pos`.
+- `make_sae_feat_steer_hook`: `(hook_name, hook)` that adds a multiple of an SAE feature's decoder direction.
+- `scale_hooks` / `set_hooks`: per-layer hooks that rescale (0 ablates) or set the residual's projection onto a direction or a set of directions. The set is orthonormalized first, so repeated or correlated directions are not double counted.
+- `proj_out`: remove the component of a vector, or each row of a stack, along a direction.
+
+```python
+hooks = scale_hooks({8: refusal_dir, 12: refusal_dir}, factor=0.0)
+with model.hooks(fwd_hooks=hooks):
+    logits = model(ids)
+
+steer = ("blocks.8.hook_resid_pre", make_add_bias_hook(vec, scale=4.0, seq_pos=slice(-3, None)))
+logits = model.run_with_hooks(ids, fwd_hooks=[steer])
+```
+
+`seq_pos` is an int, a slice, or a list of ints everywhere.
+
+### `lens`
+
+Loading and readouts for the j-lens and template-lens from the `camilablank/workspace-lenses` Hub repo, plus HTML readout widgets that work for any per-token or per-template scores.
+
+```python
+_, cache = model.run_with_cache(ids)
+jlens = load_jlens("qwen3.6-27b/j-lens/lens.pt", device=model.device)
+tlens = load_tlens("qwen3.6-27b/template-lens/templates+phrases_v3.safetensors")
+
+jlens_readout(cache, layers=[8, 16, 24], pos=-1, model=model, jlens=jlens, input_src=ids)    # top tokens per layer
+tlens_readout(cache, layers=[8, 16, 24], pos=-1, tlens=tlens, input_src=ids, tokenizer=tok)  # top templates per layer
+
+labels, _ = cluster_vocab(model, k=1024)
+jlens_cluster_readout(cache, layers=[8, 16, 24], pos=[-1, -5], model=model, jlens=jlens, labels=labels, input_src=ids)
+```
+
+- `show_logits`: top-k next-token table for every position of an input, one at a time. Click a token in the strip, or use the arrow keys, to switch position. The row of the actual next token is highlighted. Pass `model` to run it, or `logits` from your own forward pass.
+- `jlens_readout`, `tlens_readout`: one top-k table per layer at a position.
+- `jlens_cluster_readout`, `tlens_cluster_readout`: the same with the vocabulary or the templates clustered by k-means, so a diffuse readout shows as a few named clusters instead of a long tail. A tab per layer and, when `pos` is a list, a second tab bar per position.
+- `top_readout`, `cluster_readout`: the underlying widgets, for scores you computed yourself (`{header: [n] scores}` plus a names list or a decode function).
+- `get_lens_logits`, `get_tlens_scores`, `get_jlens_token_vec`, `get_template_vec`, `cluster_vocab`, `cluster_tlens`: the computations behind them.
+
+Readouts take `input_src` for the token strip: a string, ids, or a conversation. A string is tokenized with special tokens added, so for a self-rendered template string pass its ids.
+
+### `tables`
+
+`top_toks_table(logits, tok, k=10)` shows the k most likely tokens of one position's logits (`show_negative=True` adds the least likely). `show_table(headers, rows)` renders any rows. Both are HTML in a notebook kernel and a tabulate text table elsewhere.
+
+### `openrouter`
+
+Async requests with retries, a progress bar, and cost tracking. Requires `OPENROUTER_API_KEY` in a `.env` or the environment.
+
+```python
+body = await chat("What is 17 * 23?", "qwen/qwen3-30b-a3b", reasoning=False, max_tokens=64)
+print(flat(body)["text"], flat(body)["cost"])
+
+bodies = await chat_batch(convs, "qwen/qwen3-30b-a3b", concurrency=16, desc="judge")   # list, None where a request failed
+```
+
+- `chat`: one chat completion. `reasoning` is on/off or an effort string; `provider` pins one endpoint by slug. Extra kwargs go into the request body.
+- `complete`: one raw `/completions` call on a prompt string you rendered yourself.
+- `flat`: the common fields of a response body (`text`, `reasoning`, `finish_reason`, `provider`, token counts, `cost`). Store the whole body; it has more.
+- `chat_batch`, `complete_batch`: many requests at bounded concurrency, results in order.
+- `gather_bar`: the batching loop itself, for your own coroutines. Its status line shows requests done and failed, dollars spent and projected, open requests and the age of the oldest, backoff, and failed attempts by cause.
+- `endpoints`: the providers serving a model, with the slug to pin.
+
+Retries cover network errors, 408/429/5xx, timeouts and error envelopes. Other 4xx errors raise `RequestFailed`, which a batch records as `None` and moves on. A missing key or empty credits raises `RuntimeError` and stops the batch, and so does a run where the first 8 requests all fail, which usually means a bad model or parameter. Batch-stopping errors arrive wrapped in an `ExceptionGroup` (the batch runs under `asyncio.TaskGroup`), so catch them with `except*`.
+
+### `resample`
+
+Token-level resampling of a chain of thought or a response through raw `/completions`: cut the text at token positions, sample continuations from each prefix, judge them, and get P(outcome | prefix) per position with Wilson intervals.
+
+```python
+prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True)   # ends inside the open think block
+rs = Resampler(tok, prompt, cot, "rollouts.jsonl", model="qwen/qwen3-30b-a3b", provider="chutes", judge=judge, max_tokens=8192, top_p=1.0, top_k=0)
+await rs.fill({t: 50 for t in rs.grid(stride=16)})    # tops up each position to 50 rollouts on disk; rerun to fill failures
+resample_curve(rs.scores("match"))
+```
+
+`judge` is an async function from a rollout record to a dict of fields to store with it; `scores(key)` reads one of those keys. Rollouts append to a jsonl as they finish, and loading the file checks every record against the instance's configuration, so runs cannot be mixed.
+
+This only works when the provider feeds the model exactly the string you send, and nothing in a response says whether it did. Run `probe(tok, model_id, render)` on the model's endpoints first; it costs a few cents and reports which providers pass the prompt through verbatim. The `mechtools.resample` module docstring is the full checklist of what to verify and what each failure looks like. Read it before spending money.
+
+### `models`
+
+- `load_bridge(model_id)`: a `TransformerBridge` in eval mode with grads off. If `model_id` is a peft adapter repo, the base model is loaded and the adapter merged in memory.
+- `load_hf_model(model_id)`: the same as a raw HF model.
+- `is_adapter_repo(model_id)`: whether a local directory or Hub repo holds an `adapter_config.json`.
+
+### `stats`
+
+`cosine_sim`, `pearson`, `normed`, `mean_self_sim`, `topk_vector_matches`, `kmeans` (spherical, stops when labels settle), `hierarchical_kmeans`, and `wilson(k, n)` confidence intervals.
+
+### `plots`
+
+`imshow`, `line`, `scatter`, `bar`, `hist`: plotly wrappers that take tensors, arrays or lists directly, plus `renderer` and `return_fig`. `to_numpy` converts anything tensor-like. `plot_vocab_umap` scatters a subset of token vectors colored by cluster.
 
 ## Tests
 
@@ -20,48 +177,8 @@ Then `from mechtools import *` at the top of a script gives the whole prelude: c
 ./test.sh
 ```
 
-`test.sh` runs pytest offline. The tokenizer tests load Qwen3 (0.6B, 8B, 3.6-27B, 3.8-27B), Qwen2.5-3B-Instruct, gemma-3 (1b, 4b), Llama-3 (3.2-1B, 3.1-8B), Starling-LM-7B-alpha and Inkling tokenizers from the local HF cache, and the integration tests of sampling, hooks, readouts and model loading run a `TransformerBridge` around `hf-internal-testing/tiny-random-LlamaForCausalLM` (1M parameters; `hf download hf-internal-testing/tiny-random-LlamaForCausalLM` puts it in the cache). A test whose tokenizer or model is not cached is skipped, and every such test carries the `hf` marker, so `./test.sh -m "not hf"` runs the pure tests anywhere. The `openrouter`, `resample`, `models` and `plots` tests, and the unit tests of `sampling`, run on fakes (scripted models, an `httpx.MockTransport`, a stubbed `hf_hub_download`) and make no API calls; the live checks are `probe` and `sampling_defaults` in `mechtools.resample`, which spend a few cents.
+Runs pytest offline. Tests that need a tokenizer or model from the local HF cache skip when it is absent; `./test.sh -m "not hf"` runs the rest anywhere. The integration tests use `hf-internal-testing/tiny-random-LlamaForCausalLM` (1M parameters), which `hf download hf-internal-testing/tiny-random-LlamaForCausalLM` puts in the cache. No test makes an API call.
 
-## Layout
+## Not included
 
-| Module | Contents |
-|---|---|
-| `colors` | Terminal color escape constants |
-| `bars` | `pbar`: tqdm with the house style (colored desc, `ncols=120`, ascii fill); its kwargs go to tqdm, which is how the samplers' and kmeans' quiet flags hide the bar |
-| `tokens` | `to_ids`, `to_str_toks`, `show_toks` (hoverable HTML token strip; `vals=` shades each token by a scalar, red positive and blue negative, with `val_name` in the hover and a `title`), `underline_stoks` (terminal token boundaries); these four take a string (tokenized as is; `add_special_tokens=False` for a self-rendered template string, except on `underline_stoks`, which always adds them), one sequence of ids, or a conversation. `get_turn_tok_idx` (token span of one message's rendered content: on Qwen3 a `reasoning_content` field and the last turn's empty think block are template text outside it; a `<think>` block written into the last turn's content is in the span from after its opening `<think>` tag), `apply_chat_template` (left-padded batch of conversations or prompt strings, where a string is wrapped as a single user turn, not tokenized as is; the tokenizer is left unmodified), `get_assistant_mask` (ids, attention mask, and a mask over assistant tokens; with `include_eot` (the default) it raises when a template does not end a turn with one special token), `completion_loss`. Tested against Qwen3, Qwen2.5, gemma-3, Llama-3 and Starling (sentencepiece) templates; gemma-2 templates reject system messages and are not supported |
-| `tables` | `top_toks_table`, `show_table`, `html_table`, `print_titled_table`. Tables render as HTML in a notebook kernel and as tabulate text elsewhere |
-| `lens` | `load_jlens`, `load_tlens`, `jlens_transport`, `get_lens_logits`, `get_jlens_token_vec` (one token's string, encoded without BOS, or its id), `get_template_vec(s)`, `get_tlens_scores`, `print_templates`, `top_templates_table`; HTML readouts `readout_html` (dark frame with a token strip), `readout_grid`, `tabbed` (one or two tab bars over panes stacked in one grid cell, so the widget keeps the height of its tallest pane and does not resize as tabs change; after clicking the widget, left/right and up/down arrow keys switch tabs; `bars=False` hides the bars when something in the head, like a token strip, is the only selector), `top_readout`, `show_logits` (top-k next-token table for one position at a time, from a model run on the input or from logits you pass; every position read out, all of them unless `pos` restricts it, is clickable in the strip, and the actual next token's row is colored, appended below the top-k when it is not in it), `jlens_readout`, `tlens_readout`; cluster readouts `cluster_readout`, `jlens_cluster_readout`, `tlens_cluster_readout` (a tab per layer, and a second bar of tabs when `pos` is a list; one token strip above the bars marks every position read out and clicking a marked token switches to it; in `tlens_cluster_readout`, `k` is the number of k-means clusters per layer and `n_rows` the rows per table, while elsewhere `k` is the rows of top-k), `cluster_tlens`, `vocab_vecs` and `cluster_vocab` (k-means over the mean-centered unembedding, or embedding with `embed=True`). Readouts take `input_src` for the token strip: str tokens, a string, ids, or a conversation. A string is tokenized with special tokens added (BOS on Llama and gemma); only `show_logits` takes `add_special_tokens=False`, so for a self-rendered template string pass its ids to the other readouts, or the strip's positions are off by one from `pos` |
-| `hooks` | `add_bias_hook` (`scale`, `seq_pos`, `target_norm`; returns the activation's dtype and leaves the input untouched), `make_add_bias_hook`, `replace_act_hook`, `make_sae_feat_steer_hook`, `proj_out` (one vector or a stack, with `B` a single direction), `scale_hooks`, `set_hooks`. `scale_hooks` and `set_hooks` take one direction or a stack, spanned through `orthonormal_basis`, an SVD with a rank cutoff, so repeated directions are not double counted |
-| `sampling` | `stream_toks`, `stream_toks_hf`, `sample_batch`, `stream_rolling` and its list form `sample_rolling` for a `TransformerBridge` (`stream_toks_hf` for a raw HF model). All stop at any id in `eos_ids`: the HF `generation_config.eos_token_id` (an int or a list) plus the tokenizer's eos, since a chat model can end its turn with a token that is not the tokenizer's eos (gemma-3-it's tokenizer eos is `<eos>` but its turns end with `<end_of_turn>`; Qwen3's is `<|im_end|>`, and its generation config adds `<|endoftext|>`); it raises when neither is set. A returned sample of length `new_toks` hit the cap without stopping. `stream_rolling` yields each sample as it finishes, so a long run that saves as it goes survives a crash, and another call with the remaining `n` tops it up; samples come in completion order, so a run stopped early lacks up to `batch_size` in-flight samples that skew long. The batch samplers take `quiet=True` to hide the progress bar |
-| `openrouter` | Async OpenRouter requests: `chat` (chat completions; `reasoning` on/off or an effort, `provider` pin) and `complete` (raw `/completions` on a self-rendered prompt string, for CoT resampling). Both retry with backoff on network errors, 408/429/5xx, timeouts, error envelopes, unparsable or usage-less 200 bodies and a `finish_reason` of `error`; any other 4xx raises `RequestFailed` at once, and 401/402 (no key, no credits) raise `RuntimeError`, which stops a batch. They return the response body as OpenRouter sent it, so a project stores everything (reasoning signatures, refusal, cache and cost breakdowns, generation id); `flat` pulls the common fields (`text`, `reasoning`, `finish_reason`, `provider`, token counts, `cost`) out of a body. `gather_bar` awaits coroutines at bounded concurrency; one that fails with `RequestFailed` yields `None`, but once `abort_after` (8) coroutines have failed before any succeeded the batch stops with a `RuntimeError` instead of running everything to `None`. That error, the 401/402 `RuntimeError`, and any other exception from a coroutine cancel the rest and reach the caller wrapped in an `ExceptionGroup` (the gather runs under `asyncio.TaskGroup`), so catch them with `except*`, not `except RuntimeError`; the status line shows ok/fail, dollars, open requests with the age of the oldest, seconds per request, backoff, truncations, and failed attempts by cause, then a summary line. `chat_batch`, `complete_batch`, `endpoints` (sync; the providers serving a model, with the slug to pin). `load_env` loads the first `.env` found walking up from the cwd without overriding variables already set, and prints a note naming each one whose environment value differs from the file's |
-| `resample` | `Resampler`: token-level resampling of a CoT or response through raw `/completions` on a passthrough provider. `text` is tokenized after `prompt` and must not merge into its last token. `prefix(t)` (None where prompt + the cut does not retokenize to the same ids), `grid(stride)`, `rollout(t, i)` (one call, or two with `response_open`; each call raises when the provider's `prompt_tokens` disagree with the local count of the string sent), `fill({t: count})` (tops up the per-position deficit in a rollouts jsonl under `gather_bar`, so reruns and adaptive schemes are more `fill` calls; each record carries `t`, `i`, `reasoning`, `response` (the continuation), `finish_reason`, `provider`, `prompt_tokens`, `completion_tokens`, `cost`, the async judge's fields, `cfg`, a stamp of model, provider, stop, response_open, kwargs and hashes of prompt and text, and `raw`, the response bodies; loading a file checks every record's counts and stamp against the instance and raises rather than mixing runs; `(t, i)` stays unique across fills), `scores(key)` (per-position p with Wilson interval from the judge's key), `resample_curve` (plotly p-over-t with the band). `probe` checks every endpoint of a model for raw-prompt passthrough before a paid run: token-count offsets, whether continuations continue or restart, split or merged return path, leaked special tokens, the provider's completion-token constant; the verdict is pass, restarts, wrapped (+ system prompt), re-tokenized, rejected or unreachable, flagged with merged, leaked special tokens, and a constant outside 0..8. `sampling_defaults` measures whether a provider truncates sampling when top_p and top_k are omitted. The module docstring is the checklist: what to verify, what each failure looks like, and the pitfalls. The measurements behind it, from weirdchat: `docs/openrouter_provider_findings.md` |
-| `models` | `is_adapter_repo` (only a missing `adapter_config.json` means no; a gated, missing or unreachable repo raises, except offline, where a file not in the cache counts as missing), `load_hf_model` (peft adapter auto-detect and merge), `load_bridge` (`TransformerBridge.boot_transformers` around it, eval, grads off) |
-| `stats` | `normed`, `cosine_sim`, `pearson`, `mean_self_sim`, `topk_vector_matches`, `kmeans` (stops when labels settle; notes non-convergence and empty clusters; `quiet=True` hides its bar), `hierarchical_kmeans` (k-means then cosine agglomeration of the centroids; notes fewer groups than asked), `wilson` |
-| `plots` | `imshow`, `line`, `scatter`, `bar`, `hist` plotly wrappers (all take `renderer` and `return_fig`; `facet_labels` are assigned in reading order, and `labels` apply to a list of series too), `to_numpy` (tensors, arrays, scalars and lists of them to numpy); `plot_vocab_umap` (UMAP scatter of a token-vector subset colored by cluster; imports umap on first use, since its numba compilation is most of the package's import time). The general half of the shared `plotly_utils.py`; the ARENA task-specific plots are not included |
-
-Models are `TransformerBridge` objects (transformer-lens >= 3.8); there is no `HookedTransformer` path. `seq_pos` arguments take an int, a slice, or a list of ints.
-
-## Standardization candidates
-
-From a scan of 24 Python mechinterp research projects that each carried their own copies of these helpers. Sorted by breadth of duplication times how identical the copies already are. "Projects" is how many define or use the thing.
-
-| # | Candidate | Projects | Uniformity |
-|---|---|---|---|
-| 1 | Terminal color constants, `tec()`, IPython autoreload block | 15 / 9 / 17 | In `mechtools.colors` and the prelude, with the newer copies' extra colors (`brown`, `magenta`, `white`) |
-| 2 | `plotly_utils.py` (`imshow`, `line`, `scatter`, `bar`, `hist`, `to_numpy`) | 6 file copies + 4 inlined older versions | In `mechtools.plots`, from the copy shared by jlens_fun, agent-interp-envs and odd-number-hacking |
-| 3 | `top_toks_table` / `topk_toks_table`, `print_titled_table`, `top_templates_table` | 13 | In `mechtools.tables` (`top_toks_table` with `k=10`, `show_negative`, `show_probs`, `return_top`) and `mechtools.lens` (`top_templates_table`). The `initial_logits` and topk-object variants are not included |
-| 4 | OpenRouter batch querying + results json save/load | 7 | In `mechtools.openrouter`, rewritten over raw httpx rather than either lineage: weirdchat's async chat and raw-completions calls, retry policy, and progress bar. Results save/load and the sqlite cache stay in projects; the resampler's per-position deficit loop is in `mechtools.resample` |
-| 5 | Tokenizer string helpers: `to_str_toks` (3 different names), `underline_stoks`, `get_turn_tok_idx`, `find_first_idx`, `apply_chat_template` wrapper, `add_system_prompt_to_messages`, `get_assistant_mask`, `completion_loss` | 7 to 19 | In `mechtools.tokens` as `to_str_toks`, `underline_stoks`, `get_turn_tok_idx`, `apply_chat_template`, `get_assistant_mask`, `completion_loss`, rewritten around a sentinel-token span finder. `find_first_idx` and `add_system_prompt_to_messages` are not included |
-| 6 | J-lens / template-lens loading and readout (`load_jlens`, `load_tlens`, `jlens_transport`, `get_lens_logits`, `get_template_*`, `get_tlens_scores`) plus the Flask `lens.py` viewer | 4 (+2 for viewer) | In `mechtools.lens`, with the Flask viewer replaced by HTML readouts. Clustered readouts share the frame |
-| 7 | Local sampling: `stream_toks` (Bridge and HF variants), `sample_batch`, `sample_rolling`, and the `TransformerBridge.boot_transformers` + seed + `set_grad_enabled(False)` header in `local_tl.py` | 3 to 4 | In `mechtools.sampling` (`stream_toks`, `stream_toks_hf`, `sample_batch`, `stream_rolling`, `sample_rolling`) and `mechtools.models.load_bridge`; `set_seed` is in the prelude |
-| 8 | Steering and patching hooks: `add_bias_hook`, `make_sae_feat_steer_hook`, `replace_act_hook`, `scale_hook`/`set_hook` projection hooks, `proj_out` | 14 define some `*_hook` | In `mechtools.hooks`, with the seq_pos-aware and target_norm `add_bias` variants merged into one `add_bias_hook`, and the projection hooks as `scale_hooks` / `set_hooks` |
-| 9 | Model loading: `load_hf_model_with_adapter` (peft auto-detect + merge), `load_hf_model_into_hooked` | 2 verbatim, 12 use `HookedTransformer.from_pretrained`, 12 use `AutoModelForCausalLM`, 4 use Bridge | In `mechtools.models` as `load_hf_model` (adapter detection and merge, dtype, device) and `load_bridge` (a `TransformerBridge` around it, eval, `requires_grad_(False)`). No `HookedTransformer` loader |
-| 10 | `set_seed` | 12 | In the prelude (`mechtools/__init__.py`) |
-| 11 | SAE helpers: `load_sae`/`save_sae`, `top_feats_summary`, neuronpedia dashboard link, `get_latent_dec`, `get_sae_pre_acts` | 6 | Left out. CLAUDE.md lists the projects to copy from |
-| 12 | Small tensor stats: `pearson`, `cosine_sim`, `topk_vector_matches`, `get_mean_self_sim`, `kmeans`, `normed`, `wilson` CI | 4 | In `mechtools.stats`; `get_mean_self_sim` is named `mean_self_sim` there |
-| 13 | Progress bar and wandb conventions: `tqdm(..., ncols=120, ascii=" >=", desc=colored)`, `wandb.init(project, name, config=asdict)`, `load_dotenv()` at import | 9 / 7 / 11 | `pbar` and `.env` loading on import (`load_env`) are in. No wandb wrapper |
-| 14 | LLM judges (`RubricJudge`, value-leakage `_judge`, subliminal `Judge`, sae_lora classifier) | 4 | Left out. Same shape but all different prompts, and depends on #4 |
-| 15 | Activation harvesting and storage (subliminal act_store, avae `act_hoard`, GLP `MemmapWriter`, neural_chameleons `ActivationCache`, agent-interp-envs `capture`, jlens `ActivationRecorder`) | 6 | Six different designs. This is a design project, not an extraction. Skip for now |
-| 16 | Flask token viewers (`view_tokens.py` x2, `view.py`, `view_run.py`) | 4 | Each is bespoke to its data format. Only the token-strip HTML/JS is shareable |
-
-Rows 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, and 13 are in the package. Rows 11, 14, 15, and 16 are left out.
+SAE loading and feature helpers, LLM judges, and activation harvesting stay in the individual projects. Judges are a few lines on top of `openrouter.chat` with a project-specific prompt.
