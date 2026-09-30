@@ -15,7 +15,7 @@ import asyncio
 import hashlib
 import json
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -26,34 +26,39 @@ from mechtools.openrouter import RequestFailed, _usd, complete, endpoints, flat,
 from mechtools.stats import wilson
 from mechtools.tables import show_table
 
+ROLLOUT_KEYS = {"t", "i", "reasoning", "response", "finish_reason", "provider", "prompt_tokens", "completion_tokens", "cost", "cfg", "raw"}  # a rollout record's own fields; anything else on one is a verdict
+
 def _sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:16]
 
 class Resampler:
     """Resamples text (a CoT, or a reasoning-off response) from token position t: the provider continues prompt + the first t tokens of text through raw /completions, so prompt must be the rendered chat template ending inside the open think or text block, and provider must pass raw prompts through verbatim: run probe first, and read the module docstring for the rest of the checklist. text is tokenized after the prompt, as the model produced it, and must not merge into the prompt's last token. Each rollout checks the provider's prompt_tokens against the local count of the exact string sent (on the response call too) and raises otherwise.
-    Rollouts append to the jsonl at path, one per line: t, i, reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, cfg (the configuration stamp: model, provider, stop, response_open, kw, hashes of prompt and text), raw (the response bodies, one per call), plus whatever judge(rollout) returns, which may not reuse those names. judge is async (awaited) and receives only that record; response is the continuation only, so when text is a response, a judge that needs the whole response rebuilds it as resampler.prefix(rollout["t"]) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them (None or a missing key counts as other in scores).
-    A record is written only after the judge returns: a judge that raises RequestFailed makes that rollout a None in fill, its subject calls paid for and not saved, and any other exception from the judge stops the whole fill.
+    Rollouts append to the jsonl at path, one per line: t, i, reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, cfg (the configuration stamp: model, provider, stop, response_open, kw, hashes of prompt and text), raw (the response bodies, one per call). Verdicts append to the sidecar next to it (path with .judged.jsonl in place of .jsonl), one line per judged rollout: t, i, plus whatever judge(rollout) returns, which may not reuse the rollout's names; loading merges them into the records, so a rollout in memory carries its verdict's fields. judge is async (awaited) and receives only the record; response is the continuation only, so when text is a response, a judge that needs the whole response rebuilds it as resampler.prefix(rollout["t"]) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them (None or a missing key counts as other in scores).
+    A rollout is on disk before it is judged, so a judge outage costs nothing: fill judges every unjudged rollout after sampling, and judge_pending does the same on its own. A judge that raises RequestFailed leaves its rollout unjudged for the next pass; any other exception from the judge stops the pass. A file whose records carry verdict fields inline (an older format) loads as judged.
     Loading a file checks every record's token counts and stamp against the instance and raises on a mismatch, so two configurations cannot be mixed in one file.
     A provider that returns reasoning and response merged (Together) needs stop at the end-of-reasoning token and response_open, the string that opens the response block: each rollout is then two calls. kw goes to complete: max_tokens (covering reasoning plus response), temperature, top_p and top_k (pass them explicitly), timeout, ...
-    Which positions to sample and how many is up to the caller: fill({t: count}) tops up the deficit at each position, so a strided grid is one call and an adaptive scheme is a loop over fill and scores."""
+    Which positions to sample and how many is up to the caller: fill({t: count}) tops up the deficit at each position, so a strided grid is one call, and deficit(eps) is the next round of an early-stopping scheme. scores counts every rollout at each position it carries the text through (reuse): a rollout from t whose continuation starts with the text's next k tokens is a sample from t + k as well, so a stride-1 grid at a small count per position is the grid to use."""
 
     def __init__(self, tokenizer, prompt: str, text: str, path: str, model: str, provider: str, judge: Callable[[dict], Awaitable[dict]] | None = None, stop: str | None = None, response_open: str = "", **kw):
         self.tok, self.prompt, self.path, self.model, self.provider, self.judge, self.stop, self.response_open, self.kw = tokenizer, prompt, path, model, provider, judge, stop, response_open, kw
+        self.judged_path = os.path.splitext(path)[0] + ".judged.jsonl"
         self.prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
         self.n_prompt = len(self.prompt_ids)
         full = tokenizer(prompt + text, add_special_tokens=False)["input_ids"]
         if full[:self.n_prompt] != self.prompt_ids:
             raise ValueError(f"text merges into the prompt at the seam: the prompt ends with ids {self.prompt_ids[-2:]} but prompt + text has {full[self.n_prompt - 2:self.n_prompt + 1]} there, so no position cuts cleanly. Render the prompt so its last token cannot merge with the text's first (e.g. a text starting with a newline after a prompt ending in one)")
         self.ids = full[self.n_prompt:]  # the text tokenized after the prompt, as the model produced it
+        self.strs = [tokenizer.decode(self.ids[:t]) for t in range(len(self.ids) + 1)]  # the first t tokens of text as a string, for every t
         self.cfg = json.loads(json.dumps({"model": model, "provider": provider, "stop": stop, "response_open": response_open, "kw": kw, "prompt": _sha(prompt), "text": _sha(text)}, default=str))  # stamped on every rollout; round-tripped so it compares equal to a loaded one
         self._prefixes: dict[int, str | None] = {}
-        self.rollouts = self._load()
-        print(f"  {gray}prompt {self.n_prompt} tokens, text {len(self.ids)} tokens, {len(self.rollouts)} rollouts ({_usd(sum(r['cost'] for r in self.rollouts))}) on disk at {path}{endc}")
+        self._reuse: dict[tuple[int, int], int] = {}
+        self.rollouts, self.judged = self._load()
+        print(f"  {gray}prompt {self.n_prompt} tokens, text {len(self.ids)} tokens, {len(self.rollouts)} rollouts ({_usd(sum(r['cost'] for r in self.rollouts))}, {len(self.judged)} judged) on disk at {path}{endc}")
 
-    def _load(self) -> list[dict]:
-        """The rollouts on disk at path, each checked against this instance: prompt_tokens == n_prompt + t (else a different prompt or text), and its cfg stamp equal to this one where it carries one. A mismatch raises rather than mixing runs; records without a stamp (an older format) are noted."""
+    def _load(self) -> tuple[list[dict], set[tuple[int, int]]]:
+        """The rollouts on disk at path, each checked against this instance: prompt_tokens == n_prompt + t (else a different prompt or text), and its cfg stamp equal to this one where it carries one. A mismatch raises rather than mixing runs; records without a stamp (an older format) are noted. The sidecar's verdicts are merged into the records, and the (t, i) of every judged rollout come back with them."""
         if not os.path.exists(self.path):
-            return []
+            return [], set()
         rollouts = [json.loads(line) for line in open(self.path)]
         unstamped = 0
         for n, r in enumerate(rollouts, 1):
@@ -66,13 +71,21 @@ class Resampler:
                 raise ValueError(f"{self.path} line {n}: rollout sampled under a different configuration, {' and '.join(diff)} differ: {[r['cfg'].get(k) for k in diff]} on disk vs {[self.cfg[k] for k in diff]} here")
         if unstamped:
             print(f"  {yellow}{unstamped} rollouts in {self.path} carry no configuration stamp (an older format); only their token counts were checked{endc}")
-        return rollouts
+        judged = {(r["t"], r["i"]) for r in rollouts if r.keys() - ROLLOUT_KEYS}
+        by_key = {(r["t"], r["i"]): r for r in rollouts}
+        for n, line in enumerate(open(self.judged_path) if os.path.exists(self.judged_path) else [], 1):
+            v = json.loads(line)
+            key = (v.pop("t"), v.pop("i"))
+            if key not in by_key:
+                raise ValueError(f"{self.judged_path} line {n}: a verdict for rollout {key}, which {self.path} does not hold")
+            by_key[key] |= v
+            judged.add(key)
+        return rollouts, judged
 
     def prefix(self, t: int) -> str | None:
         """The first t tokens of text as a string, or None when prompt + that string does not retokenize to the prompt's ids followed by those t ids (a cut inside a multi-byte character, or a token that only exists merged with its neighbor). What is sent is prompt + prefix, so that is what is checked. Cached per instance."""
         if t not in self._prefixes:
-            s = self.tok.decode(self.ids[:t])
-            self._prefixes[t] = s if self.tok(self.prompt + s, add_special_tokens=False)["input_ids"] == self.prompt_ids + self.ids[:t] else None
+            self._prefixes[t] = self.strs[t] if self.tok(self.prompt + self.strs[t], add_special_tokens=False)["input_ids"] == self.prompt_ids + self.ids[:t] else None
         return self._prefixes[t]
 
     def grid(self, stride: int) -> list[int]:
@@ -80,7 +93,7 @@ class Resampler:
         return sorted(set(range(0, len(self.ids) + 1, stride)) | {len(self.ids)})
 
     async def rollout(self, t: int, i: int, client: httpx.AsyncClient | None = None) -> dict:
-        """One continuation from position t, judged, appended to the file and to self.rollouts. With response_open the response is sampled in a second call after the reasoning stops, and stays empty when the reasoning hit max_tokens. Both calls check the provider's prompt_tokens against the local count of the exact string sent."""
+        """One continuation from position t, appended to the file and to self.rollouts, not yet judged. With response_open the response is sampled in a second call after the reasoning stops, and stays empty when the reasoning hit max_tokens. Both calls check the provider's prompt_tokens against the local count of the exact string sent."""
         if not 0 <= t <= len(self.ids):
             raise ValueError(f"t={t} is outside the text's {len(self.ids)} tokens")
         if self.prefix(t) is None:
@@ -102,18 +115,36 @@ class Resampler:
                 if r2["prompt_tokens"] != n2:
                     raise RuntimeError(f"t={t}: {r2['provider']} counted {r2['prompt_tokens']} prompt tokens on the response call, expected {n2}: it wrapped or re-tokenized the reasoning")
                 rec |= {"response": r2["text"] or "", "finish_reason": r2["finish_reason"], "completion_tokens": rec["completion_tokens"] + r2["completion_tokens"], "cost": rec["cost"] + r2["cost"], "raw": [body, body2]}
-        if self.judge:
-            verdict = await self.judge(rec)
-            if clash := verdict.keys() & rec.keys():
-                raise ValueError(f"the judge returned {sorted(clash)}, which would overwrite the rollout's own fields; return other names")
-            rec |= verdict
         with open(self.path, "a") as f:
             f.write(json.dumps(rec) + "\n")
         self.rollouts.append(rec)
         return rec
 
+    async def _judge_one(self, rec: dict) -> dict:
+        verdict = await self.judge(rec)
+        if clash := verdict.keys() & rec.keys():
+            raise ValueError(f"the judge returned {sorted(clash)}, which would overwrite the rollout's own fields; return other names")
+        with open(self.judged_path, "a") as f:
+            f.write(json.dumps({"t": rec["t"], "i": rec["i"], **verdict}) + "\n")
+        rec |= verdict
+        self.judged.add((rec["t"], rec["i"]))
+        return rec
+
+    async def judge_pending(self, concurrency: int = 32, desc: str = "judge") -> list[dict | None]:
+        """Judges every rollout on disk without a verdict, at most concurrency at a time under gather_bar, appending each verdict to the sidecar as it comes. Returns the rollouts judged, None where the judge failed with RequestFailed; the next call tries those again. fill calls this after sampling."""
+        if self.judge is None:
+            raise ValueError("no judge set")
+        todo = [r for r in self.rollouts if (r["t"], r["i"]) not in self.judged]
+        if not todo:
+            return []
+        print(f"  {gray}{len(todo)} rollouts to judge{endc}")
+        recs = await gather_bar([self._judge_one(r) for r in todo], concurrency, desc)
+        if None in recs:
+            print(f"  {yellow}{recs.count(None)} judgments failed (causes in the summary above); another judge_pending or fill call tries them again{endc}")
+        return recs
+
     async def fill(self, want: dict[int, int], concurrency: int = 32, desc: str = "resample") -> list[dict | None]:
-        """Samples until each position t in want has want[t] rollouts on disk, at most concurrency at a time under gather_bar. Positions whose prefix does not retokenize are skipped with a note. Returns the new rollouts, None where one failed; calling again samples those. i continues from the largest on disk at t, so (t, i) is unique across fills."""
+        """Samples until each position t in want has want[t] rollouts on disk, at most concurrency at a time under gather_bar, then judges every unjudged rollout on disk (judge_pending) when a judge is set. Positions whose prefix does not retokenize are skipped with a note. Returns the new rollouts, None where sampling failed; calling again samples those and judges whatever the judge failed on. i continues from the largest on disk at t, so (t, i) is unique across fills."""
         skipped = [t for t in want if self.prefix(t) is None]
         if skipped:
             print(f"  {yellow}skipping {len(skipped)} positions whose prefix does not retokenize identically: {skipped[:20]}{endc}")
@@ -122,21 +153,59 @@ class Resampler:
         todo = [(t, next_i[t] + k) for t in want if t not in skipped for k in range(want[t] - done[t])]
         est = f", ~{_usd(len(todo) * sum(r['cost'] for r in self.rollouts) / len(self.rollouts))} at the mean cost so far" if self.rollouts else ""
         print(f"  {gray}{len(todo)} rollouts to sample over {len(want) - len(skipped)} positions, {sum(done[t] for t in want)} already on disk{est}{endc}")
-        if not todo:
-            return []
-        async with httpx.AsyncClient(limits=httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)) as client:
-            recs = await gather_bar([self.rollout(t, i, client) for t, i in todo], concurrency, desc)
-        if None in recs:
-            print(f"  {yellow}{recs.count(None)} rollouts failed (causes in the summary above); another fill call samples them again{endc}")
+        recs = []
+        if todo:
+            async with httpx.AsyncClient(limits=httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)) as client:
+                recs = await gather_bar([self.rollout(t, i, client) for t, i in todo], concurrency, desc)
+            if None in recs:
+                print(f"  {yellow}{recs.count(None)} rollouts failed (causes in the summary above); another fill call samples them again{endc}")
+        if self.judge:
+            await self.judge_pending(concurrency)
         return recs
 
-    def scores(self, key: str = "match") -> list[dict]:
-        """Per position with rollouts, sorted by t: n rollouts, k with key True, judged (True or False), other (None or missing), p = k / judged, ci (Wilson), token (the one ending the prefix)."""
+    def reuse(self, r: dict) -> int:
+        """How many of the text's tokens after t the rollout r continues with: the k such that prompt + prefix + its continuation (reasoning where the provider split it, else response) tokenizes to the prompt's ids, the prefix's, the text's tokens t+1..t+k, then something else. The rollout is then a sample from every position through t + k, exactly: conditional on producing those tokens, the rest of it is drawn from the model at t + k. Cached per rollout; scores tokenizes the uncached ones in one batch."""
+        if (r["t"], r["i"]) not in self._reuse:
+            self._reuse_fill([r])
+        return self._reuse[r["t"], r["i"]]
+
+    def _reuse_fill(self, rollouts: list[dict]):
+        strings = [self.prompt + self.strs[r["t"]] + (r["reasoning"] if r["reasoning"] is not None else r["response"]) for r in rollouts]
+        for r, ids in zip(rollouts, self.tok(strings, add_special_tokens=False)["input_ids"] if rollouts else []):
+            t, k = r["t"], 0
+            if ids[:self.n_prompt + t] == self.prompt_ids + self.ids[:t]:  # else the continuation merged into the prefix's last token, so it did not produce the text's next token
+                while t + k < len(self.ids) and self.n_prompt + t + k < len(ids) and ids[self.n_prompt + t + k] == self.ids[t + k]:
+                    k += 1
+            self._reuse[t, r["i"]] = k
+
+    def scores(self, key: str = "match", reuse: bool = True) -> list[dict]:
+        """Per position with samples, sorted by t: n samples, direct (the rollouts sampled at t itself), k with key True, judged (True or False), other (None or missing, so unjudged rollouts too), p = k / judged, ci (Wilson), token (the one ending the prefix). With reuse, a rollout counts at every position through t + self.reuse(rollout), so n is the effective count and positions never sampled directly appear, including those fill skips."""
+        vals, direct = defaultdict(list), Counter()
+        if reuse:
+            self._reuse_fill([r for r in self.rollouts if (r["t"], r["i"]) not in self._reuse])
+        for r in self.rollouts:
+            direct[r["t"]] += 1
+            for t in range(r["t"], r["t"] + (self.reuse(r) if reuse else 0) + 1):
+                vals[t].append(r.get(key))
+        if pending := sum((r["t"], r["i"]) not in self.judged for r in self.rollouts):
+            print(f"  {yellow}{pending} rollouts are not judged yet and count as other{endc}")
         out = []
-        for t in sorted({r["t"] for r in self.rollouts}):
-            vals = [r.get(key) for r in self.rollouts if r["t"] == t]
-            k, judged = vals.count(True), vals.count(True) + vals.count(False)
-            out.append({"t": t, "token": self.tok.decode(self.ids[t - 1:t]) if t else "", "n": len(vals), "k": k, "judged": judged, "other": len(vals) - judged, "p": k / judged if judged else float("nan"), "ci": wilson(k, judged)})
+        for t in sorted(vals):
+            k, judged = vals[t].count(True), vals[t].count(True) + vals[t].count(False)
+            out.append({"t": t, "token": self.tok.decode(self.ids[t - 1:t]) if t else "", "n": len(vals[t]), "direct": direct[t], "k": k, "judged": judged, "other": len(vals[t]) - judged, "p": k / judged if judged else float("nan"), "ci": wilson(k, judged)})
+        return out
+
+    def deficit(self, eps: float, key: str = "match", positions: list[int] | None = None, batch: int = 5, n_min: int = 0, n_max: int | None = None) -> dict[int, int]:
+        """What to fill next so that every position's estimate is tight enough: {t: rollouts wanted at t} over positions (default every one that can be sampled), asking batch more where the Wilson half-width of p is above eps, or min(batch, what the floor lacks) while fewer than n_min samples are judged there, and nothing once n samples reach n_max (all counted with reuse). Empty when every position is settled, so `while d := rs.deficit(0.1, n_min=20): await rs.fill(d)` is the early-stopping loop, a round at a time so that rollouts drawn early in the text cover later positions before those are asked for. Raises while rollouts are unjudged (judge_pending first), since it would ask for replacements for them. The interval alone reads rare outcomes as dead (at p = 0.05, a batch of 5 without a hit settles the position at about 16 samples), so pair eps with a floor of about 3 / (the smallest p to resolve)."""
+        if pending := sum((r["t"], r["i"]) not in self.judged for r in self.rollouts):
+            raise RuntimeError(f"{pending} rollouts are not judged yet: judge_pending() first, or deficit would ask for replacements for them")
+        sc = {s["t"]: s for s in self.scores(key)}
+        out = {}
+        for t in positions if positions is not None else range(len(self.ids) + 1):
+            s = sc.get(t, {"n": 0, "direct": 0, "judged": 0, "ci": (0.0, 1.0)})
+            extra = min(batch, n_min - s["judged"]) if s["judged"] < n_min else batch if s["ci"][1] - s["ci"][0] > 2 * eps else 0
+            if extra and (n_max is None or s["n"] < n_max) and self.prefix(t) is not None:
+                out[t] = s["direct"] + extra
         return out
 
 PROBE_MSGS = [{"role": "user", "content": "What is 17 * 23?"}]
@@ -194,7 +263,7 @@ async def sampling_defaults(model: str, provider: str, prompt: str, n: int = 500
 def resample_curve(scores: list[dict], title: str = "", renderer=None, return_fig: bool = False):
     """p over t from Resampler.scores with the Wilson band; hovering a point shows its token, counts and interval."""
     ts, p, lo, hi = [s["t"] for s in scores], [s["p"] for s in scores], [s["ci"][0] for s in scores], [s["ci"][1] for s in scores]
-    hover = [f"t={s['t']} {s['token']!r}<br>p={s['p']:.2f} [{s['ci'][0]:.2f}, {s['ci'][1]:.2f}]<br>{s['k']}/{s['judged']} judged, {s['other']} other" for s in scores]
+    hover = [f"t={s['t']} {s['token']!r}<br>p={s['p']:.2f} [{s['ci'][0]:.2f}, {s['ci'][1]:.2f}]<br>{s['k']}/{s['judged']} judged, {s['other']} other, {s['direct']} of {s['n']} sampled here" for s in scores]
     fig = go.Figure([go.Scatter(x=ts + ts[::-1], y=hi + lo[::-1], fill="toself", fillcolor="rgba(31,119,180,0.2)", line={"width": 0}, hoverinfo="skip", showlegend=False),
                      go.Scatter(x=ts, y=p, mode="lines+markers", line={"color": "rgb(31,119,180)"}, text=hover, hoverinfo="text", showlegend=False)])
     fig.update_layout(title=title, xaxis_title="prefix tokens t", yaxis_title="p", yaxis_range=[0, 1], template="plotly_white")

@@ -149,11 +149,15 @@ Token-level resampling of a chain of thought or a response through raw `/complet
 ```python
 prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True)   # ends inside the open think block
 rs = Resampler(tok, prompt, cot, "rollouts.jsonl", model="qwen/qwen3-30b-a3b", provider="chutes", judge=judge, max_tokens=8192, top_p=1.0, top_k=0)
-await rs.fill({t: 50 for t in rs.grid(stride=16)})    # tops up each position to 50 rollouts on disk; rerun to fill failures
+await rs.fill({t: 10 for t in rs.grid(stride=1)})     # tops up each position to 10 rollouts on disk, then judges them; rerun to fill failures
+while d := rs.deficit(0.1, n_min=20):                  # early stopping: 5 more wherever the interval is still wider than +-0.1 or fewer than 20 samples are in
+    await rs.fill(d)
 resample_curve(rs.scores("match"))
 ```
 
-`judge` is an async function from a rollout record to a dict of fields to store with it; `scores(key)` reads one of those keys. Rollouts append to a jsonl as they finish, and loading the file checks every record against the instance's configuration, so runs cannot be mixed.
+`judge` is an async function from a rollout record to a dict of fields to store with it; `scores(key)` reads one of those keys. Rollouts append to a jsonl as they finish and verdicts to a sidecar next to it, so a judge outage costs nothing: the next `fill` judges what is pending. Loading the file checks every record against the instance's configuration, so runs cannot be mixed.
+
+`scores` counts a rollout at every position it carries the text through: a continuation from t that reproduces the text's next k tokens is a sample from t + k as well, exactly. On a 165-token math response that gave 7.9 effective samples per rollout, which is why a stride of 1 at a small count per position beats a coarse grid at a large one, and why `deficit` measures its floor and interval on the effective counts.
 
 This only works when the provider feeds the model exactly the string you send, and nothing in a response says whether it did. Run `probe(tok, model_id, render)` on the model's endpoints first; it costs a few cents and reports which providers pass the prompt through verbatim. The `mechtools.resample` module docstring is the full checklist of what to verify and what each failure looks like. Read it before spending money.
 

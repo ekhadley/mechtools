@@ -58,12 +58,13 @@ def test_fill_scores(tok, tmp_path, monkeypatch):
     assert recs[2] == {"t": 40, "i": 0, "reasoning": " more thinking", "response": "**391**", "finish_reason": "stop", "provider": "Fake", "prompt_tokens": 60, "completion_tokens": 5, "cost": 0.001, "cfg": res.cfg, "raw": [recs[2]["raw"][0]], "match": True, "why": "x"} and recs[2]["raw"][0]["choices"][0]["text"] == "**391**"
     assert res.cfg == {"model": "m", "provider": "p", "stop": None, "response_open": "", "kw": {"max_tokens": 64}, "prompt": res.cfg["prompt"], "text": res.cfg["text"]} and len(res.cfg["prompt"]) == 16
     assert calls[2] == (PROMPT + res.prefix(40), None, {"max_tokens": 64})
-    assert sorted(json.loads(line)["t"] for line in open(path)) == [0, 0, 40, 40, 40, 54] and res.rollouts == recs
+    assert sorted(json.loads(line)["t"] for line in open(path)) == [0, 0, 40, 40, 40, 54] and res.rollouts == recs and "match" not in json.loads(open(path).readline())
+    assert sorted((v["t"], v["i"], v["match"], v.get("why")) for v in map(json.loads, open(res.judged_path))) == [(0, 0, False, "x"), (0, 1, False, "x"), (40, 0, True, "x"), (40, 1, True, "x"), (40, 2, True, "x"), (54, 0, None, None)]
     assert asyncio.run(res.fill({0: 2, 40: 3})) == []  # no deficit
     res2 = Resampler(tok, PROMPT, TEXT, path, "m", "p", judge=judge, max_tokens=64)  # a new instance with the same configuration loads the file and tops up
     assert [(r["t"], r["i"]) for r in asyncio.run(res2.fill({40: 4}))] == [(40, 3)]
     sc = res2.scores()
-    assert [(s["t"], s["n"], s["k"], s["judged"], s["other"]) for s in sc] == [(0, 2, 0, 2, 0), (40, 4, 4, 4, 0), (54, 1, 0, 0, 1)]
+    assert [(s["t"], s["n"], s["k"], s["judged"], s["other"]) for s in sc] == [(0, 2, 0, 2, 0), (40, 4, 4, 4, 0), (54, 1, 0, 0, 1)] and all(s["direct"] == s["n"] for s in sc)  # the fake never continues the text, so no reuse
     assert sc[0]["p"] == 0.0 and sc[1]["p"] == 1.0 and sc[1]["ci"] == wilson(4, 4) and math.isnan(sc[2]["p"])
     assert sc[0]["token"] == "" and sc[1]["token"] == tok.decode(res.ids[39:40]) and sc[2]["token"] == "."
     assert len(resample_curve(sc, return_fig=True).data) == 2
@@ -191,7 +192,7 @@ def test_judge_cannot_overwrite_fields(tok, tmp_path, monkeypatch):
     res = Resampler(tok, PROMPT, TEXT, str(tmp_path / "r.jsonl"), "m", "p", judge=judge)
     with pytest.raises(ExceptionGroup) as e:
         asyncio.run(res.fill({0: 1}))
-    assert isinstance(e.value.exceptions[0], ValueError) and "['cost']" in str(e.value.exceptions[0]) and not os.path.exists(res.path)
+    assert isinstance(e.value.exceptions[0], ValueError) and "['cost']" in str(e.value.exceptions[0]) and os.path.exists(res.path) and not os.path.exists(res.judged_path)  # the rollout is saved, the verdict is not
 
 def test_fill_indices_stay_unique_after_failures(tok, tmp_path, monkeypatch):
     base, calls = fake_complete(tok, []), itertools.count()
@@ -205,3 +206,61 @@ def test_fill_indices_stay_unique_after_failures(tok, tmp_path, monkeypatch):
     assert [None if r is None else r["i"] for r in recs] == [0, None, 2]
     assert [r["i"] for r in asyncio.run(res.fill({0: 3}))] == [3]  # not 2 again
     assert sorted(r["i"] for r in res.rollouts) == [0, 2, 3]
+
+def test_reuse(tok, tmp_path, monkeypatch):
+    """A rollout that continues with the text's next k tokens is a sample from every position through t + k."""
+    ks = itertools.cycle([0, 3, 44])
+    async def complete(prompt, model, provider, stop=None, client=None, **kw):
+        t, k = len(tok(prompt, add_special_tokens=False)["input_ids"]) - 20, next(ks)
+        rec = {"finish_reason": "stop", "provider": "Fake", "model": model, "prompt_tokens": 20 + t, "completion_tokens": 5, "reasoning_tokens": None, "cost": 0.001}
+        return body({"text": " zzz", "reasoning": None, **rec} if k == 0 else {"text": "**391**", "reasoning": tok.decode(res.ids[t:t + k]) + " zzz", **rec})
+    monkeypatch.setattr(rs, "complete", complete)
+    async def judge(r):
+        return {"match": r["reasoning"] is not None}
+    res = Resampler(tok, PROMPT, TEXT, str(tmp_path / "r.jsonl"), "m", "p", judge=judge)
+    recs = asyncio.run(res.fill({10: 3}))
+    assert sorted(res.reuse(r) for r in recs) == [0, 3, 44]  # the one without reasoning is compared through its response
+    sc = res.scores()
+    assert [(s["t"], s["n"], s["direct"], s["k"]) for s in sc[:5]] == [(10, 3, 3, 2), (11, 2, 0, 2), (12, 2, 0, 2), (13, 2, 0, 2), (14, 1, 0, 1)] and len(sc) == 45 and sc[-1]["t"] == 54  # 51, which cannot be sampled, is covered
+    assert sc[0]["ci"] == wilson(2, 3) and sc[1]["p"] == 1.0 and sc[1]["ci"] == wilson(2, 2)
+    assert [(s["t"], s["n"], s["direct"]) for s in res.scores(reuse=False)] == [(10, 3, 3)]
+
+def test_judge_after_save(tok, tmp_path, monkeypatch):
+    """A rollout is on disk before the judge sees it; a judge failure leaves it unjudged for the next pass."""
+    monkeypatch.setattr(rs, "complete", fake_complete(tok, []))
+    n = itertools.count()
+    async def judge(r):
+        if next(n) == 1:
+            raise RequestFailed("429", "throttled")
+        return {"match": True}
+    path = str(tmp_path / "r.jsonl")
+    res = Resampler(tok, PROMPT, TEXT, path, "m", "p", judge=judge)
+    recs = asyncio.run(res.fill({0: 3}))
+    assert [r["i"] for r in recs] == [0, 1, 2] and sum("match" in r for r in recs) == 2 and len(res.judged) == 2 and len(list(open(res.judged_path))) == 2
+    with pytest.raises(RuntimeError, match="1 rollouts are not judged"):
+        res.deficit(0.1)
+    assert [r["match"] for r in asyncio.run(res.judge_pending())] == [True] and res.judged == {(0, 0), (0, 1), (0, 2)}
+    res2 = Resampler(tok, PROMPT, TEXT, path, "m", "p", judge=judge)  # a reload merges the sidecar
+    assert res2.judged == res.judged and [r["match"] for r in res2.rollouts] == [True] * 3 and asyncio.run(res2.judge_pending()) == []
+    with open(tmp_path / "old.jsonl", "w") as f:  # verdicts inline, an older format: loaded as judged
+        f.writelines(json.dumps(r) + "\n" for r in res2.rollouts)
+    old = Resampler(tok, PROMPT, TEXT, str(tmp_path / "old.jsonl"), "m", "p", judge=judge)
+    assert old.judged == res.judged and asyncio.run(old.judge_pending()) == [] and not os.path.exists(old.judged_path)
+    with open(res.judged_path, "a") as f:
+        f.write(json.dumps({"t": 0, "i": 9, "match": True}) + "\n")
+    with pytest.raises(ValueError, match=r"rollout \(0, 9\), which"):
+        Resampler(tok, PROMPT, TEXT, path, "m", "p")
+
+def test_deficit(tok, tmp_path, monkeypatch):
+    monkeypatch.setattr(rs, "complete", fake_complete(tok, []))
+    flips = itertools.cycle([True, False])
+    async def judge(r):
+        return {"match": next(flips)}
+    res = Resampler(tok, PROMPT, TEXT, str(tmp_path / "r.jsonl"), "m", "p", judge=judge)
+    assert res.deficit(0.1) == {t: 5 for t in range(55) if t != 51} and res.deficit(0.1, n_min=20, batch=8, positions=[3, 7]) == {3: 8, 7: 8}
+    asyncio.run(res.fill({0: 100, 20: 4}))
+    d = res.deficit(0.1)  # p = 0.5 at t=0 with 100 samples: half-width 0.098
+    assert 0 not in d and d[20] == 9 and d[1] == 5
+    assert res.deficit(0.05)[0] == 105 and 0 not in res.deficit(0.05, n_max=100)
+    assert res.deficit(0.5, n_min=20)[20] == 9 and 0 not in res.deficit(0.5, n_min=20)  # the floor is asked for a batch at a time
+    assert res.deficit(0.5, n_min=6) == {t: 5 for t in range(55) if t not in (0, 20, 51)} | {20: 6}

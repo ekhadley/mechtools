@@ -33,25 +33,28 @@ def test_star_import_has_no_collisions():
             assert getattr(mechtools, name) is obj, name
     assert {"chat", "complete", "gather_bar", "Resampler", "probe", "show_logits", "imshow", "line", "kmeans", "wilson", "to_ids", "get_assistant_mask", "sample_rolling", "load_bridge", "add_bias_hook", "top_toks_table", "tec", "set_seed", "pbar", "cyan"} <= set(dir(mechtools))
 
+DOCS = [(README, "## Modules", re.compile(r"^### `(\w+)`\n(.*?)(?=^### |\Z)", re.M | re.S)), (README.parent / "CLAUDE.md", "## Module details", re.compile(r"^\| `(\w+)` \| (.*) \|$", re.M))]  # per module: a README subsection, a CLAUDE.md table row
+
 @pytest.mark.skipif(not README.exists(), reason="README.md is only next to an editable install")
-def test_readme_layout_names_exist():
-    """Every backticked identifier in the README's Layout table names something in the package (a function, class, method or parameter), so renames update the docs."""
-    layout = README.read_text().split("## Layout")[1].split("\n## ")[0]
-    prose = {"HookedTransformer", "TransformerBridge", "text", "reasoning", "response", "finish_reason", "prompt_tokens", "completion_tokens", "cost", "raw", "cfg", "reasoning_content", "error"}  # classes from other packages, fields of flat and rollout records and messages, a finish_reason value
-    for row in re.findall(r"^\| `(\w+)` \| (.*) \|$", layout, flags=re.M):
-        mod = importlib.import_module(f"mechtools.{row[0]}")
-        names = public(mod)
-        known = set(names) | set(dir(builtins)) | prose
-        for obj in names.values():
-            for f in ([obj] + list(vars(obj).values()) if inspect.isclass(obj) else [obj]):  # a class, its methods and their parameters
-                known |= set(vars(obj)) if inspect.isclass(obj) else set()
-                if callable(f):
-                    try:
-                        known |= set(inspect.signature(f).parameters)
-                    except (TypeError, ValueError):
-                        pass
-        missing = {tok for tok in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", row[1]) if tok not in known}
-        assert not missing, f"README row for {row[0]} names {sorted(missing)}, which do not exist there"
+def test_doc_names_exist():
+    """Every backticked identifier in the README's module sections and in CLAUDE.md's module details table names something in that module (a function, class, method or parameter), so renames update the docs."""
+    prose = {"HookedTransformer", "TransformerBridge", "text", "reasoning", "response", "finish_reason", "prompt_tokens", "completion_tokens", "cost", "raw", "cfg", "direct", "reasoning_content", "error", "enable_thinking", "OPENROUTER_API_KEY"}  # classes from other packages, fields of flat, rollout and scores records and of messages, a finish_reason value, a template kwarg, the key's variable
+    for path, heading, pattern in DOCS:
+        for name, body in pattern.findall(path.read_text().split(heading)[1].split("\n## ")[0]):
+            body = re.sub(r"```.*?```", "", body, flags=re.S)  # code blocks are examples, not names
+            mod = importlib.import_module(f"mechtools.{name}")
+            names = public(mod)
+            known = set(names) | set(dir(builtins)) | prose
+            for obj in names.values():
+                for f in ([obj] + list(vars(obj).values()) if inspect.isclass(obj) else [obj]):  # a class, its methods and their parameters
+                    known |= set(vars(obj)) if inspect.isclass(obj) else set()
+                    if callable(f):
+                        try:
+                            known |= set(inspect.signature(f).parameters)
+                        except (TypeError, ValueError):
+                            pass
+            missing = {tok for tok in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", body) if tok not in known}
+            assert not missing, f"{path.name} section for {name} names {sorted(missing)}, which do not exist there"
 
 def test_prelude_helpers():
     set_seed(3)
