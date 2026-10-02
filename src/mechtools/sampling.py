@@ -1,6 +1,6 @@
 import torch as t
 from torch import Tensor
-from transformers.cache_utils import DynamicLayer
+from transformers.cache_utils import DynamicLayer, DynamicSlidingWindowLayer
 
 from mechtools.bars import pbar
 
@@ -55,7 +55,7 @@ def sample_batch(model, prompt_toks: Tensor, n: int, new_toks: int = 512, quiet:
     return [row[:length] for row, length in zip(gen.tolist(), lengths.tolist())]
 
 def stream_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks: int, quiet: bool = False):
-    """Yield n independent temperature-1 samples from one prompt [1, seq] as each finishes, generated as a rolling batch: a row that ends (eos or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. A restarted row is left-padded to the batch's cache length, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos (any id in eos_ids). quiet hides the progress bar.
+    """Yield n independent temperature-1 samples from one prompt [1, seq] as each finishes, generated as a rolling batch: a row that ends (eos or new_toks) is restarted in place from the prompt while samples remain to start, else dropped from the batch. The cache is as wide as the longest live row, whatever n is: a shorter row is left-padded to it, with the mask and position ids covering only its real tokens. Each sample is cut before its first eos (any id in eos_ids). quiet hides the progress bar.
     Save each sample as it arrives and a crash or interrupt keeps everything that finished; another call with the remaining n tops up. Samples come in completion order, so a run stopped early lacks up to batch_size samples that skew long, the rows in flight. The body runs when consumed, not when called: hooks, seed and grad contexts must enclose the consuming loop, and a generator kept but not exhausted keeps the batch's cache on the device."""
     eos, last, plen = eos_ids(model), prompt_toks[0, -1], prompt_toks.shape[1] - 1
     B = min(batch_size, n)
@@ -67,7 +67,10 @@ def stream_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
     n_started = B
     with pbar(total=n, desc="sampling", disable=quiet) as bar:
         while gen:
-            S = cache.get_seq_length()
+            S = int(n_real.max())  # cache entries of the longest live row: every row masks the entries left of them, so they are dropped
+            for layer in cache.layers:
+                if isinstance(layer, DynamicLayer): layer.keys, layer.values = layer.keys[:, :, -S:], layer.values[:, :, -S:]
+                if isinstance(layer, DynamicSlidingWindowLayer): layer.cumulative_length = S  # the length a sliding-window layer reports, its keys holding at most the window
             mask = (t.arange(S + 1, device=toks.device) >= (S - n_real)[:, None]).long()
             logits, cache = model(toks, return_type="logits_and_cache", past_key_values=cache, use_cache=True, attention_mask=mask, position_ids=n_real[:, None])
             toks = t.multinomial(t.softmax(logits[:, -1].float(), dim=-1), num_samples=1)
@@ -85,7 +88,7 @@ def stream_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
                 n_started += 1
                 keep.append(i)
                 for layer, (a, b) in zip(cache.layers, template):  # entries left of the prompt are stale but masked
-                    if isinstance(layer, DynamicLayer): layer.keys[i, :, S + 1 - plen:], layer.values[i, :, S + 1 - plen:] = a, b
+                    if isinstance(layer, DynamicLayer): layer.keys[i, :, -plen:], layer.values[i, :, -plen:] = a, b
                     else: layer.conv_states[0][i], layer.recurrent_states[0][i] = a, b
                 toks[i], n_real[i], gen[i] = last, plen, []
             if len(keep) < len(gen):
