@@ -30,7 +30,7 @@ class FakeModel:
     def rule(pos, prev):
         return (pos * 3 + prev) % 50 + 8  # never an eos id, never below 8
 
-    def __call__(self, toks, return_type=None, past_key_values=None, use_cache=True, attention_mask=None, position_ids=None):
+    def __call__(self, toks, return_type=None, past_key_values=None, use_cache=True, attention_mask=None, position_ids=None, logits_to_keep=0):
         B, S_new = toks.shape
         cache = past_key_values if past_key_values is not None else DynamicCache()
         S_old = cache.get_seq_length()
@@ -57,7 +57,7 @@ class FakeModel:
             else:
                 logits[b, -1, self.rule(p, prev)] = 0.0
         self.calls.append((B, S_old))
-        return logits, cache
+        return logits[:, -logits_to_keep:], cache  # as the HF head does: the last logits_to_keep positions, or all of them at 0
 
 class FakeHF(FakeModel):
     """FakeModel in the raw HF call shape."""
@@ -100,6 +100,7 @@ class Checked:
     def __call__(self, toks, return_type=None, **kw):
         if "attention_mask" not in kw:  # the prefill
             logits, self.cache = self.model(toks, return_type=return_type, **kw)
+            assert logits.shape[1] == 1  # the head ran on one position, not on every prompt token of every row
             def reorder(keep, hf_reorder=self.cache.reorder_cache):
                 hf_reorder(keep)
                 self.rows = [self.rows[i] for i in keep.tolist()]

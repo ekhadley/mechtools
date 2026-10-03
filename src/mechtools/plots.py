@@ -7,6 +7,13 @@ import torch as t
 from plotly.subplots import make_subplots
 from torch import Tensor
 
+DARK = {"template": "plotly_dark", "paper_bgcolor": "#1a1a19", "plot_bgcolor": "#1a1a19", "font": {"color": "#c3c2b7"}}  # the dark house style, as layout kwargs: fig.update_layout(**DARK)
+SERIES = ["#3987e5", "#d95926", "#199e70", "#c98500"]  # categorical slots 1-4 for the dark surface, in fixed order
+
+def write_dark_html(fig, path: str):
+    """fig as a standalone page whose whole body is the dark surface, not just the figure."""
+    open(path, "w").write(fig.to_html().replace("<head>", '<head><style>html, body { background: #1a1a19; margin: 0; }</style>', 1))
+
 def to_numpy(tensor):
     """
     A numpy array from a tensor (detached, on cpu, bfloat16 upcast to float32), a numpy array or scalar, a Python scalar, or a list/tuple of any of those (lists of tensors included).

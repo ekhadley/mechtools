@@ -5,14 +5,18 @@ import json
 import math
 import os
 import weakref
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch as t
 from conftest import load_tokenizer
 
 import mechtools.resample as rs
 from mechtools.openrouter import RequestFailed
+from mechtools.plots import DARK, SERIES
 from mechtools.resample import *
+from mechtools.sampling import eos_ids, sample_rolling
 from mechtools.stats import wilson
 
 PROMPT = "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n"  # 20 Qwen3 tokens
@@ -324,3 +328,205 @@ def test_recursion_is_unbiased_with_a_calibrated_interval():
     assert mse["recursion"] < 0.8 * mse["reuse"] < 0.8 * mse["naive"], mse
     assert abs(np.mean(err["recursion"])) < 0.003 and abs(z.mean()) < 0.05, (np.mean(err["recursion"]), z.mean())
     assert 0.85 < np.mean(z ** 2) < 1.2 and 0.92 < np.mean(np.abs(z) < 1.96) < 0.98, (np.mean(z ** 2), np.mean(np.abs(z) < 1.96))
+
+K_TOKENIZERS = ["Qwen/Qwen3-0.6B", "meta-llama/Llama-3.2-1B-Instruct", "google/gemma-3-1b-it"]  # two byte-level BPEs and a sentencepiece
+K_PROMPT, K_TEXT = "Question: what is 17 * 23?\nAnswer:\n", "Okay, 17 * 23: 17 * 20 = 340,   17 * 3 = 51,\n\n\tso 340 + 51 = 391. 𐍈 done, 1234567 and  890 unbelievably."
+
+@pytest.mark.hf
+@pytest.mark.parametrize("name", K_TOKENIZERS)
+def test_k_ids_and_k_joint(name):
+    """The reuse count from sampled ids (k_ids, right by construction) against the one from text (k_joint), on cases built from ids so the truth is known. They agree wherever the text tokenizes back to the sampled ids; k_joint is lower for ids that end inside a multi-byte character and higher for a sampled split the tokenizer would not produce."""
+    tk = load_tokenizer(name)
+    enc = lambda s: tk(s, add_special_tokens=False)["input_ids"]
+    p_ids = enc(K_PROMPT)
+    ids = enc(K_PROMPT + K_TEXT)[len(p_ids):]
+    trace, T = {"prompt": K_PROMPT, "prompt_ids": p_ids, "ids": ids}, len(ids)
+    pre = [tk.decode(ids[:t]) for t in range(T + 1)]
+    clean = [t for t in range(T + 1) if enc(K_PROMPT + pre[t]) == p_ids + ids[:t]]  # the cuts a Resampler samples from
+    text = lambda t, c: tk.decode(ids[:t] + c)[len(pre[t]):]  # a continuation as a provider returns it
+    assert len(clean) > 0.9 * T and all(k_ids(ids[t:], ids, t) == k_joint(tk, trace, t, text(t, ids[t:])) == T - t for t in clean)  # the rest of the trace, through its runs of spaces and digits
+    dep, stable, cases = enc(" zebra"), 0, 0
+    for t in clean:
+        for k in (0, 1, 3, 6):
+            if t + k < T:
+                c = ids[t:t + k] + dep  # the trace's next k tokens, then a departure
+                assert k_ids(c, ids, t) == k
+                cases += 1
+                if joint_ids(tk, trace, [(t, text(t, c))]) == [c]:
+                    stable += 1
+                    assert k_joint(tk, trace, t, text(t, c)) == k
+    assert stable > 0.7 * cases
+    assert k_ids([], ids, 3) == k_joint(tk, trace, clean[2], "") == k_ids([], ids, T) == k_joint(tk, trace, T, "") == 0 and joint_ids(tk, trace, []) == []  # an empty continuation, and the end of the trace
+    assert joint_ids(tk, trace, [(1, "s")]) == [None] and k_joint(tk, trace, 1, "s") == 0  # "Okay" + "s": the continuation merges into the prefix's last token
+    inside = next(j for j in range(T + 1) if "�" in pre[j])  # a cut inside the multi-byte character
+    t0 = max(t for t in clean if t < inside)
+    assert k_ids(ids[t0:inside], ids, t0) == inside - t0 > k_joint(tk, trace, t0, text(t0, ids[t0:inside]))  # the ids match through the cut; their text ends in a replacement character
+    odd = next(a + b for j in range(1, 4) for a, b in [(enc("Okay"[:j]), enc("Okay"[j:]))] if len(a) == len(b) == 1)  # "Okay" sampled as two tokens, where the tokenizer makes one
+    assert k_ids(odd + ids[1:3], ids, 0) == 0 < k_joint(tk, trace, 0, text(0, odd + ids[1:3]))  # the text is the trace's, so k_joint counts tokens the rollout did not sample
+
+def trace_of(tok, cap=None) -> dict:
+    p_ids = tok(PROMPT, add_special_tokens=False)["input_ids"]
+    return {"prompt": PROMPT, "prompt_ids": p_ids, "ids": tok(PROMPT + TEXT, add_special_tokens=False)["input_ids"][len(p_ids):], "text": TEXT, "cap": cap}
+
+def api_record(t: int, i: int, response: str, stopped: bool = True, reasoning: str | None = None, **verdict) -> dict:
+    return {"t": t, "i": i, "reasoning": reasoning, "response": response, "finish_reason": "stop" if stopped else "length", "provider": "Fake", "prompt_tokens": 20 + t, "completion_tokens": 7, "cost": 0.001, "cfg": {}, "raw": [], **verdict}
+
+def write_jsonl(path, recs: list[dict]) -> str:
+    open(path, "w").write("".join(json.dumps(r) + "\n" for r in recs))
+    return str(path)
+
+def test_load_rollouts_reads_both_shapes_alike(tok, tmp_path):
+    """The same rollouts stored as local records and as Resampler records load to the same ids, text, k, stopped and capped, with one cap rule for both."""
+    trace = trace_of(tok, cap=30)
+    ids, zzz = trace["ids"], tok(" zzz", add_special_tokens=False)["input_ids"]
+    conts = [(20, 0, ids[20:29], True), (20, 1, ids[20:30], True), (20, 2, ids[20:31], True), (20, 3, ids[20:25] + zzz, False), (10, 0, zzz, True)]  # t + len(ids) one below the cap, at it and above it; one that did not stop; one that leaves the trace at once
+    local = load_rollouts(trace, write_jsonl(tmp_path / "x_local.jsonl", [{"t": t, "i": i, "ids": c, "ended": s} for t, i, c, s in conts]), tok)
+    api = load_rollouts(trace, write_jsonl(tmp_path / "x_api.jsonl", [api_record(t, i, tok.decode(c), s) for t, i, c, s in conts]), tok)
+    same = lambda rows: [(r["t"], r["i"], r["ids"], r["text"], r["k"], r["stopped"], r["capped"]) for r in rows]
+    assert same(local) == same(api) == [(t, i, c, tok.decode(c), k, s, cap) for (t, i, c, s), k, cap in zip(conts, [9, 10, 11, 5, 0], [False, True, True, True, False])]
+    assert [r["tokens"] for r in local] == [10, 11, 12, 5 + len(zzz), len(zzz) + 1] and [r["tokens"] for r in api] == [7] * 5  # the ids plus one for a stop; the provider's count
+    assert local[0]["raw"] == {"t": 20, "i": 0, "ids": ids[20:29], "ended": True} and api[0]["raw"]["response"] == tok.decode(ids[20:29])
+    assert [r["capped"] for r in load_rollouts(trace | {"cap": None}, str(tmp_path / "x_api.jsonl"), tok)] == [False, False, False, True, False]  # no cap: only the rollout that did not stop
+
+def test_load_rollouts_text_of_a_resampler_record(tok, tmp_path):
+    """The continuation of a Resampler record is its reasoning where it holds one, else its response; one that merges into the prefix has k = 0 and its ids from the text alone."""
+    trace = trace_of(tok)
+    rows = load_rollouts(trace, write_jsonl(tmp_path / "r.jsonl", [api_record(10, 0, "**391**", reasoning=tok.decode(trace["ids"][10:12]) + " zzz"), api_record(10, 1, " zzz"), api_record(1, 0, "s")]), tok)
+    assert [(r["text"], r["k"]) for r in rows] == [(tok.decode(trace["ids"][10:12]) + " zzz", 2), (" zzz", 0), ("s", 0)]
+    assert rows[2]["ids"] == tok("s", add_special_tokens=False)["input_ids"] and joint_ids(tok, trace, [(1, "s")]) == [None]  # "Okay" + "s" is another token
+
+def test_load_rollouts_verdicts_and_failures(tok, tmp_path):
+    """Inline verdicts and the sidecar's load the same; a verdict without its rollout, a repeated (t, i), a record of neither shape and a verdict named like a reader field raise."""
+    trace, zzz = trace_of(tok), tok(" zzz", add_special_tokens=False)["input_ids"]
+    recs = [{"t": 3, "i": 0, "ids": zzz, "ended": True}, {"t": 3, "i": 1, "ids": zzz, "ended": False}]
+    verdicts = [{"match": True, "answer": 391}, {"match": None, "answer": None}]
+    inline = load_rollouts(trace, write_jsonl(tmp_path / "a.jsonl", [r | v for r, v in zip(recs, verdicts)]), tok)
+    path = write_jsonl(tmp_path / "b.jsonl", recs)
+    assert all("match" not in r for r in load_rollouts(trace, path, tok))
+    write_jsonl(tmp_path / "b.judged.jsonl", [{"t": r["t"], "i": r["i"]} | v for r, v in zip(recs, verdicts)])
+    side = load_rollouts(trace, path, tok)
+    drop_raw = lambda rows: [{f: v for f, v in r.items() if f != "raw"} for r in rows]
+    assert drop_raw(inline) == drop_raw(side) and [(r["match"], r["answer"]) for r in side] == [(True, 391), (None, None)] and side[0]["raw"] == recs[0]
+    assert [s["p"] for s in rollout_scores(trace, side, tok)] == [1.0] and rollout_scores(trace, side, tok, lambda r: r["stopped"])[0]["k"] == 1  # a verdict field, or a function of the rollout
+    write_jsonl(tmp_path / "b.judged.jsonl", [{"t": 9, "i": 0, "match": True}])
+    with pytest.raises(ValueError, match="does not hold"):
+        load_rollouts(trace, path, tok)
+    for bad, why in (([recs[0], recs[0]], "repeat"), ([{"t": 3, "i": 0, "text": "x"}], "neither ids nor response"), ([recs[0] | {"k": 2}], "named like")):
+        with pytest.raises(ValueError, match=why):
+            load_rollouts(trace, write_jsonl(tmp_path / "c.jsonl", bad), tok)
+
+def test_rollout_scores_equal_resampler_scores(tok, tmp_path, monkeypatch):
+    """The reader over a Resampler's file gives that Resampler's reuse counts and, through rollout_scores, its scores for all three methods."""
+    ks = itertools.cycle([0, 3, 44, 7])
+    async def complete(prompt, model, provider, stop=None, client=None, **kw):
+        t, k = len(tok(prompt, add_special_tokens=False)["input_ids"]) - 20, next(ks)
+        rec = {"finish_reason": "stop", "provider": "Fake", "model": model, "prompt_tokens": 20 + t, "completion_tokens": 5, "reasoning_tokens": None, "cost": 0.001}
+        return body({"text": " zzz", "reasoning": None, **rec} if k == 0 else {"text": "**391**", "reasoning": tok.decode(res.ids[t:t + k]) + " zzz", **rec})
+    monkeypatch.setattr(rs, "complete", complete)
+    async def judge(r):
+        return {"match": r["reasoning"] is not None and r["i"] != 2}
+    path = str(tmp_path / "r.jsonl")
+    res = Resampler(tok, PROMPT, TEXT, path, "m", "p", judge=judge)
+    asyncio.run(res.fill({0: 4, 10: 4, 30: 3}))
+    trace = {"prompt": PROMPT, "prompt_ids": res.prompt_ids, "ids": res.ids, "text": TEXT, "cap": None}
+    rollouts = load_rollouts(trace, path, tok)
+    assert [r["k"] for r in rollouts] == [res.reuse(r) for r in res.rollouts] and sorted({r["k"] for r in rollouts}) == [0, 3, 7, 24, 44]
+    for method in ("naive", "reuse", "recursion"):
+        assert rollout_scores(trace, rollouts, tok, "match", method) == res.scores("match", method) == rollout_scores(trace, rollouts, tok, lambda r: r["match"], method)
+
+class Sharp:
+    """The tiny model with its logits scaled until its next-token distributions have shape (a top token near 0.2, a third of the mass on tokens under 1%), and two stop tokens at about 3% each per step."""
+    EOS = [5, 9]
+
+    def __init__(self, model):
+        self.model, self.generation_config = model, SimpleNamespace(eos_token_id=self.EOS)
+
+    def __call__(self, toks, return_type="logits", **kw):
+        out = self.model(toks, return_type=return_type, **kw)
+        logits = (out[0] if return_type == "logits_and_cache" else out) * 60
+        logits[..., self.EOS] = logits.logsumexp(-1, keepdim=True) - 3.5
+        return (logits, out[1]) if return_type == "logits_and_cache" else logits
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+CALIB_TRACE = {"prompt_ids": [1, 100, 200, 300], "ids": [400, 500, 600, 700, 800, 900, 1000, 1100]}
+
+def test_calib_rollouts_equals_a_direct_computation(tiny_bridge):
+    """Each rollout's scores against the formulas applied to one uncached forward of its own sequence in float64: a stopped rollout (its stop scored, the eos ids merged), one past the 100-step chunk that hit the cap (no stop scored), and an empty one that stopped at once. The scores do not depend on what a row is batched with."""
+    model = Sharp(tiny_bridge)
+    eos = sorted(eos_ids(model))
+    assert len(eos) == 3
+    rollouts = [{"t": 2, "i": 0, "ids": [11, 12, 13], "stopped": True, "raw": {}}, {"t": 6, "i": 0, "ids": t.randint(10, 30000, (130,), generator=t.Generator().manual_seed(0)).tolist(), "stopped": False, "raw": {}}, {"t": 0, "i": 1, "ids": [], "stopped": True, "raw": {}}]
+    def direct(r):
+        x = r["ids"] + eos[-1:] * r["stopped"]
+        lp = model(t.tensor([CALIB_TRACE["prompt_ids"] + CALIB_TRACE["ids"][:r["t"]] + r["ids"]]))[0, 3 + r["t"]:3 + r["t"] + len(x)].double().log_softmax(-1)
+        stop = lp[:, eos].logsumexp(-1)
+        lp[:, eos] = -math.inf
+        lp[:, eos[-1]] = stop
+        p = lp.exp()
+        plp, lx = t.where(p > 0, p * lp, 0.0), lp[t.arange(len(x)), x]
+        H, a, ps = -plp.sum(-1), (p * (p < 0.01)).sum(-1), p[:, eos[-1]]
+        return {"t": r["t"], "i": r["i"], "n": len(x), "s": (lx + H).sum().item(), "v": ((plp * t.where(p > 0, lp, 0.0)).sum(-1) - H * H).sum().item(), "rare": [float((lx < math.log(0.01)).sum()), a.sum().item(), (a * (1 - a)).sum().item()], "stop": [float(r["stopped"]), ps.sum().item(), (ps * (1 - ps)).sum().item()]}
+    want = {(r["t"], r["i"]): direct(r) for r in rollouts}
+    assert [w["n"] for w in want.values()] == [4, 130, 1] and want[6, 0]["rare"][0] > 100 and 0.05 < want[2, 0]["stop"][1] < 0.5
+    for batch_size in (1, 3):
+        got = calib_rollouts(model, CALIB_TRACE, rollouts, batch_size, quiet=True)
+        assert [(c["t"], c["i"]) for c in got] == [(0, 1), (2, 0), (6, 0)]  # shortest sequence first
+        for c in got:
+            w = want[c["t"], c["i"]]
+            assert c["n"] == w["n"] and c["rare"][0] == w["rare"][0] and c["stop"][0] == w["stop"][0]
+            assert [c["s"], c["v"], *c["rare"][1:], *c["stop"][1:]] == pytest.approx([w["s"], w["v"], *w["rare"][1:], *w["stop"][1:]], rel=1e-4, abs=1e-4)
+
+def test_calib_check_passes_the_models_own_samples_and_flags_altered_ones(tiny_bridge):
+    """Rollouts sampled from the model by stream_rolling, and by a plain uncached loop, pass. A higher temperature, sampling from the top 5 tokens, and rollouts ended where the model would not are each flagged by the score meant for them."""
+    model = Sharp(tiny_bridge)
+    eos = eos_ids(model)
+    prefix = lambda cut: CALIB_TRACE["prompt_ids"] + CALIB_TRACE["ids"][:cut]
+    def sample(transform):
+        out = []
+        for cut in (0, 4, 8):
+            seqs = t.tensor([prefix(cut)] * 40)
+            for _ in range(24):
+                seqs = t.cat([seqs, t.multinomial(transform(model(seqs)[:, -1]).softmax(-1), 1)], 1)
+            for i, row in enumerate(seqs[:, 4 + cut:].tolist()):
+                end = next((j for j, x in enumerate(row) if x in eos), None)
+                out.append({"t": cut, "i": i, "ids": row[:end], "stopped": end is not None, "raw": {}})
+        return out
+    check = lambda rollouts: calib_check(calib_rollouts(model, CALIB_TRACE, rollouts, 16, quiet=True))
+    t.manual_seed(0)
+    own = [{"t": cut, "i": i, "ids": ids, "stopped": len(ids) < 24, "raw": {}} for cut in (0, 4, 8) for i, ids in enumerate(sample_rolling(model, t.tensor([prefix(cut)]), 40, 40, 24, quiet=True))]
+    c = check(own)
+    assert c["rollouts"] == 120 and c["tokens"] > 1000 and not c["flagged"] and abs(c["temperature"] - 1) < 0.05 and 0.3 < sum(r["stopped"] for r in own) / 120 < 0.95
+    assert not check(sample(lambda lg: lg))["flagged"]
+    hot = check(sample(lambda lg: lg / 1.3))
+    assert hot["flagged"] and hot["z"]["tokens"] < -5 and hot["z"]["rare"] > 3 and hot["temperature"] > 1.15
+    top = check(sample(lambda lg: lg.masked_fill(lg < lg.topk(5).values[:, -1:], -math.inf)))
+    assert top["flagged"] and top["z"]["rare"] < -5 and top["z"]["tokens"] > 5 and top["temperature"] < 0.9
+    early = check([r | {"ids": r["ids"][:2], "stopped": True} for r in own])
+    assert early["flagged"] and early["z"]["stops"] > 5
+
+def test_calib_check_sums_and_edges():
+    a = [{"t": 0, "i": 0, "n": 10, "s": -2.0, "v": 4.0, "rare": [1.0, 0.5, 0.4], "stop": [1.0, 0.7, 0.2]}]
+    b = [{"t": 0, "i": 1, "n": 30, "s": 1.0, "v": 5.0, "rare": [0.0, 0.5, 0.6], "stop": [0.0, 0.2, 0.05]}]
+    c = calib_check(a + b)
+    assert c == {"rollouts": 2, "tokens": 40, "mean_s": pytest.approx(-1 / 40), "temperature": pytest.approx(1 + -1 / (2 * -1 - 9)), "z": {"tokens": pytest.approx(-1 / 3), "rare": pytest.approx(0.0), "stops": pytest.approx(0.1 / 0.5)}, "flagged": False}
+    assert calib_check(a)["z"]["tokens"] == -1.0 and calib_check(a, z_max=0.9)["flagged"] and not calib_check(a, z_max=1.2)["flagged"]
+    still = [a[0] | {"rare": [3.0, 3.0, 0.0], "stop": [1.0, 1.0, 0.0]}]  # nothing uncertain about rare tokens or stops, and what was seen is what was expected
+    assert calib_check(still)["z"] == {"tokens": -1.0, "rare": 0.0, "stops": 0.0}
+    off = calib_check([a[0] | {"stop": [1.0, 0.0, 0.0]}])  # a stop where the model gives one no chance
+    assert off["z"]["stops"] == math.inf and off["flagged"]
+    with pytest.raises(ValueError, match="reasoning"):
+        calib_rollouts(None, {}, [{"t": 0, "i": 0, "ids": [1], "stopped": True, "raw": {"reasoning": "thinking"}}])
+
+def test_resample_curve_overlays_and_plain_estimates():
+    sc = estimate(6, [(0, 6, True), (0, 2, True), (0, 0, False), (3, 3, True), (3, 1, False), (5, 1, True)], "recursion")  # estimate's own output: no token
+    assert all("token" not in s for s in sc) and any(s["ci"][1] > 1 for s in sc)
+    fig = resample_curve(sc, return_fig=True)
+    assert len(fig.data) == 2 and fig.layout.paper_bgcolor == DARK["paper_bgcolor"] and all(0 <= y <= 1 for y in fig.data[0].y)  # the band is clipped
+    assert fig.data[1].text[0].startswith("t=0<br>p=") and not fig.data[1].showlegend
+    named = {f"source {j}": sc for j in range(5)}
+    fig = resample_curve(named, return_fig=True)
+    assert len(fig.data) == 10 and [d.name for d in fig.data[1::2]] == list(named) and [d.line.dash for d in fig.data[1::2]] == ["solid"] * 4 + ["dash"] and fig.data[9].line.color == fig.data[1].line.color == SERIES[0] and fig.data[9].text[0].startswith("source 4: t=0<br>")
+    with pytest.raises(ValueError, match="9 curves"):
+        resample_curve({str(j): sc for j in range(9)}, return_fig=True)

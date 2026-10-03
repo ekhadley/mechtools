@@ -9,7 +9,8 @@ The model continues the CoT only if the provider feeds it exactly the rendered p
 3. Resample on the endpoint that produced the base rollouts, or accept that the curve measures the resampling endpoint's deployment: quantization (fp8, fp4, unlisted) and sampling defaults differ. Pass top_p=1.0 and top_k=0 explicitly: CoreWeave applied Qwen's generation_config (top_k 20, top_p 0.95) when they were omitted, Chutes and Phala did not; sampling_defaults measures this. seed is honored by some providers and ignored by others. Cross-provider curves agreed within Wilson intervals at S=50; base-rate differences below that resolution went undetected.
 4. max_tokens must cover reasoning plus response: Inkling traces exhausted 8192 and produced empty responses that looked like throttling. Such rollouts finish with "length" and are not retried; they count as other in scores only if the judge returns None (or omits the key) for them, and a judge that returns False for an empty response biases p downward. A few-hundred-token trace at S=50 stride 1 costs tens of dollars on a $2/M model, and a judge costs about as much as the subject on cheap ones.
 5. At run time every rollout checks prompt_tokens == n_prompt + t (and the response call's count on a two-stage provider) and raises otherwise, catching wrapping, re-tokenization, or a provider change mid-run; inside fill that raise stops the batch (as an ExceptionGroup), with the rollouts finished so far on disk. finish_reason "error" (a mid-stream abort whose usage is wrong too) is retried inside complete. Resampler does not check the base record; in the project, check it against the same tokenizer: len(tokenizer(prompt, add_special_tokens=False)["input_ids"]) == its prompt_tokens (plus a known constant, e.g. Inkling's appended block), and its completion_tokens minus the local tokens of reasoning + response equal to the provider's constant (1 or 2 for DeepSeek and Qwen: closing tag and EOS; 5 to 7 for Inkling), a larger gap being a truncated trace. usage reasoning_tokens is 0 or wrong on many providers: count from text.
-   Cuts inside a multi-byte character (byte-level BPE) do not retokenize and are skipped. Providers throttle in bursts (DeepInfra 429s independent of request rate, Together 503s above ~12 concurrent two-stage rollouts): keep concurrency at 12 to 32 and call fill again. Prompt logprobs and echo are unavailable on the raw endpoint, so prompt identity rests on counts plus the continuation check. Closed-lab models return summarized or encrypted reasoning and cannot be resampled."""
+   Cuts inside a multi-byte character (byte-level BPE) do not retokenize and are skipped. Providers throttle in bursts (DeepInfra 429s independent of request rate, Together 503s above ~12 concurrent two-stage rollouts): keep concurrency at 12 to 32 and call fill again. Prompt logprobs and echo are unavailable on the raw endpoint, so prompt identity rests on counts plus the continuation check. Closed-lab models return summarized or encrypted reasoning and cannot be resampled.
+6. Before the rollouts are analyzed on local weights or pooled with local rollouts, check that the provider samples as the local model does: load_rollouts on about 150 of them, calib_rollouts with the local model, calib_check. A provider can pass every check above and still sample from another distribution: on 2026-10-03 DeepInfra's Llama-3.1-8B put P(correct) 0.23 below the local model's and Parasail's Llama-3.2-3B ended responses early, while all seven Qwen3.5-9B and Qwen3.8-27B deployments tested matched. calib_check's docstring says what a pass covers."""
 
 import asyncio
 import hashlib
@@ -21,9 +22,13 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 import plotly.graph_objects as go
+import torch as t
 
+from mechtools.bars import pbar
 from mechtools.colors import *
 from mechtools.openrouter import RequestFailed, _usd, complete, endpoints, flat, gather_bar
+from mechtools.plots import DARK, SERIES
+from mechtools.sampling import eos_ids
 from mechtools.stats import wilson
 from mechtools.tables import show_table
 
@@ -64,6 +69,25 @@ def estimate(T: int, rollouts: list[tuple[int, int, bool | None]], method: str =
                 v[t] += (1 - m) ** 2 * v[t + 1] + m * (1 - m) * (p[t + 1] - r) ** 2 / n
             out[t]["p"], out[t]["ci"] = p[t], (p[t] - 1.96 * math.sqrt(v[t]), p[t] + 1.96 * math.sqrt(v[t]))
     return [out[t] for t in sorted(out)]
+
+def k_ids(ids: list[int], trace_ids: list[int], t: int) -> int:
+    """The reuse count of a rollout from t whose sampled ids are known: how many of the trace's tokens after its first t the continuation starts with."""
+    k = 0
+    while k < len(ids) and t + k < len(trace_ids) and ids[k] == trace_ids[t + k]:
+        k += 1
+    return k
+
+def joint_ids(tokenizer, trace: dict, cuts: list[tuple[int, str]]) -> list[list[int] | None]:
+    """A continuation's ids recovered from its text, per (t, continuation): prompt + the trace's first t tokens + the continuation tokenized as one string, less the prompt's and the prefix's ids. None where that string no longer starts with those ids, the continuation having merged into the prefix's last token. trace needs prompt, prompt_ids and ids.
+    These are the tokenizer's split of the text, which is not always the split the model sampled: measured on local rollouts, 2 to 4% of Llama-3 rollouts and 0.1% of Qwen3.5 rollouts hold a token pair the tokenizer would split otherwise, nearly always after the rollout has left the trace (the reuse count from these ids was wrong in 1 of 8,600)."""
+    n, pre = len(trace["prompt_ids"]), {t: tokenizer.decode(trace["ids"][:t]) for t in {t for t, _ in cuts}}
+    full = tokenizer([trace["prompt"] + pre[t] + c for t, c in cuts], add_special_tokens=False)["input_ids"] if cuts else []
+    return [ids[n + t:] if ids[:n + t] == trace["prompt_ids"] + trace["ids"][:t] else None for (t, _), ids in zip(cuts, full)]
+
+def k_joint(tokenizer, trace: dict, t: int, continuation: str) -> int:
+    """The reuse count of a rollout known only as text: k_ids of its joint_ids, and 0 where the continuation merged into the prefix, so it did not produce the trace's next token."""
+    ids = joint_ids(tokenizer, trace, [(t, continuation)])[0]
+    return 0 if ids is None else k_ids(ids, trace["ids"], t)
 
 class Resampler:
     """Resamples text (a CoT, or a reasoning-off response) from token position t: the provider continues prompt + the first t tokens of text through raw /completions, so prompt must be the rendered chat template ending inside the open think or text block, and provider must pass raw prompts through verbatim: run probe first, and read the module docstring for the rest of the checklist. text is tokenized after the prompt, as the model produced it, and must not merge into the prompt's last token. Each rollout checks the provider's prompt_tokens against the local count of the exact string sent (on the response call too) and raises otherwise.
@@ -204,13 +228,9 @@ class Resampler:
         return self._reuse[r["t"], r["i"]]
 
     def _reuse_fill(self, rollouts: list[dict]):
-        strings = [self.prompt + self.strs[r["t"]] + (r["reasoning"] if r["reasoning"] is not None else r["response"]) for r in rollouts]
-        for r, ids in zip(rollouts, self.tok(strings, add_special_tokens=False)["input_ids"] if rollouts else []):
-            t, k = r["t"], 0
-            if ids[:self.n_prompt + t] == self.prompt_ids + self.ids[:t]:  # else the continuation merged into the prefix's last token, so it did not produce the text's next token
-                while t + k < len(self.ids) and self.n_prompt + t + k < len(ids) and ids[self.n_prompt + t + k] == self.ids[t + k]:
-                    k += 1
-            self._reuse[t, r["i"]] = k
+        trace = {"prompt": self.prompt, "prompt_ids": self.prompt_ids, "ids": self.ids}
+        for r, ids in zip(rollouts, joint_ids(self.tok, trace, [(r["t"], r["reasoning"] if r["reasoning"] is not None else r["response"]) for r in rollouts])):
+            self._reuse[r["t"], r["i"]] = 0 if ids is None else k_ids(ids, self.ids, r["t"])
 
     def scores(self, key: str = "match", method: str = "reuse") -> list[dict]:
         """estimate over the rollouts on disk, with the outcome read from key (a verdict field; None or missing, so unjudged rollouts too, counts as other), plus each position's token (the one ending the prefix). With reuse or the recursion, a rollout counts at every position through t + self.reuse(rollout), so n is the effective count and positions never sampled directly appear, including those fill skips."""
@@ -235,6 +255,44 @@ class Resampler:
             if extra and (n_max is None or s["n"] < n_max) and self.prefix(t) is not None:
                 out[t] = s["direct"] + extra
         return out
+
+def load_rollouts(trace: dict, path: str, tokenizer) -> list[dict]:
+    """The rollouts of one source of a trace, sampled locally or through a provider, in one form, so that analysis is written once. trace holds prompt (the rendered string), prompt_ids, ids (the trace's tokens after the prompt) and cap (the most tokens a response may hold, prefix plus continuation, or None). path is a jsonl with one rollout per line, t (trace tokens kept) and i unique in the file, in either shape: local, with ids (the continuation's sampled tokens) and ended (an eos came before the cap), or a Resampler record. Any other field is a verdict, and the sidecar next to the file (.judged.jsonl in place of .jsonl) adds verdicts keyed by (t, i).
+    Per rollout: t, i, ids (as sampled; for a Resampler record joint_ids of the text, or the text tokenized alone where it merged into the prefix), text (the continuation: the decoded ids, or reasoning where the record holds one, else response), stopped (ended, or finish_reason "stop"), capped (not stopped, or t + len(ids) >= cap: one rule for both sources, since Resampler counts max_tokens from the cut and the local samplers cap the total length, and reuse needs a rollout's distribution not to depend on its cut), k (the reuse count: k_ids of sampled ids, else of the joint ids, 0 where they merged), tokens (len(ids) plus one for a stop, or the provider's completion_tokens), the verdict fields, and raw (the stored record)."""
+    recs = [json.loads(line) for line in open(path)]
+    verdicts = {(r["t"], r["i"]): {f: v for f, v in r.items() if f not in ROLLOUT_KEYS | {"ids", "ended"}} for r in recs}
+    if len(verdicts) != len(recs):
+        raise ValueError(f"{path}: {len(recs) - len(verdicts)} rollouts repeat the (t, i) of another")
+    side = os.path.splitext(path)[0] + ".judged.jsonl"
+    for n, line in enumerate(open(side) if os.path.exists(side) else [], 1):
+        v = json.loads(line)
+        key = (v.pop("t"), v.pop("i"))
+        if key not in verdicts:
+            raise ValueError(f"{side} line {n}: a verdict for rollout {key}, which {path} does not hold")
+        verdicts[key] |= v
+    if bad := [(r["t"], r["i"]) for r in recs if "ids" not in r and "response" not in r]:
+        raise ValueError(f"{path}: rollouts {bad[:3]} hold neither ids nor response")
+    api = [j for j, r in enumerate(recs) if "ids" not in r]
+    text = {j: recs[j]["reasoning"] if recs[j].get("reasoning") is not None else recs[j]["response"] for j in api}
+    joint = dict(zip(api, joint_ids(tokenizer, trace, [(recs[j]["t"], text[j]) for j in api])))
+    out = []
+    for j, r in enumerate(recs):
+        if "ids" in r:
+            row = {"ids": r["ids"], "text": tokenizer.decode(r["ids"]), "stopped": r["ended"], "k": k_ids(r["ids"], trace["ids"], r["t"]), "tokens": len(r["ids"]) + r["ended"]}
+        else:
+            row = {"ids": joint[j] if joint[j] is not None else tokenizer(text[j], add_special_tokens=False)["input_ids"], "text": text[j], "stopped": r["finish_reason"] == "stop", "k": 0 if joint[j] is None else k_ids(joint[j], trace["ids"], r["t"]), "tokens": r["completion_tokens"]}
+        row = {"t": r["t"], "i": r["i"], **row, "capped": not row["stopped"] or (trace["cap"] is not None and r["t"] + len(row["ids"]) >= trace["cap"]), "raw": r}
+        if clash := row.keys() & verdicts[r["t"], r["i"]].keys():
+            raise ValueError(f"{path}: rollout {(r['t'], r['i'])} has verdict fields named like the reader's own: {sorted(clash)}")
+        out.append(row | verdicts[r["t"], r["i"]])
+    return out
+
+def rollout_scores(trace: dict, rollouts: list[dict], tokenizer, key="match", method: str = "reuse") -> list[dict]:
+    """estimate over load_rollouts' output, as Resampler.scores gives for its own file: the outcome is the verdict field key, or key(rollout) where key is a function (an outcome computed from the text, which then applies the cap rule itself: lambda r: not r["capped"] and ...), and each position carries its token."""
+    out = estimate(len(trace["ids"]), [(r["t"], r["k"], key(r) if callable(key) else r.get(key)) for r in rollouts], method)
+    for s in out:
+        s["token"] = tokenizer.decode(trace["ids"][s["t"] - 1:s["t"]]) if s["t"] else ""
+    return out
 
 PROBE_MSGS = [{"role": "user", "content": "What is 17 * 23?"}]
 PROBE_COT = "Okay, 17 * 23. 17 * 20 = 340, 17 * 3 = 51, so 340 + 51 ="  # ends on a token boundary; a model that sees the open think block continues with " 391"
@@ -288,11 +346,53 @@ async def sampling_defaults(model: str, provider: str, prompt: str, n: int = 500
             print(f"  {name}: {len(counts[name])} distinct tokens in {sum(counts[name].values())} draws; top {counts[name].most_common(5)}, tail {counts[name].most_common()[-5:]}")
     return counts
 
-def resample_curve(scores: list[dict], title: str = "", renderer=None, return_fig: bool = False):
-    """p over t from Resampler.scores with the Wilson band; hovering a point shows its token, counts and interval."""
-    ts, p, lo, hi = [s["t"] for s in scores], [s["p"] for s in scores], [s["ci"][0] for s in scores], [s["ci"][1] for s in scores]
-    hover = [f"t={s['t']} {s['token']!r}<br>p={s['p']:.2f} [{s['ci'][0]:.2f}, {s['ci'][1]:.2f}]<br>{s['k']}/{s['judged']} judged, {s['other']} other, {s['direct']} of {s['n']} sampled here" for s in scores]
-    fig = go.Figure([go.Scatter(x=ts + ts[::-1], y=hi + lo[::-1], fill="toself", fillcolor="rgba(31,119,180,0.2)", line={"width": 0}, hoverinfo="skip", showlegend=False),
-                     go.Scatter(x=ts, y=p, mode="lines+markers", line={"color": "rgb(31,119,180)"}, text=hover, hoverinfo="text", showlegend=False)])
-    fig.update_layout(title=title, xaxis_title="prefix tokens t", yaxis_title="p", yaxis_range=[0, 1], template="plotly_white")
+def calib_rollouts(model, trace: dict, rollouts: list[dict], batch_size: int = 8, quiet: bool = False) -> list[dict]:
+    """Every sampled token of every rollout (load_rollouts' output) against the local model, for calib_check: do a provider's rollouts look like samples from this model? Each rollout runs through one uncached forward as prompt ids + the trace's first t ids + its ids, in right-padded batches sorted by length; the forward returns logits for batch x length x vocabulary, which sets batch_size (14 GiB at 24 rows of 1,200 tokens on a 248k vocabulary). The model's eos ids are merged into one stop token at every step, since a rollout does not record which of them ended it, and the stop that ended a rollout is scored as its last token.
+    Per rollout: t, i, n (tokens scored), and sums over its steps, with p the model's distribution at a step and x the token sampled there: s of log p(x) + H(p), which has mean 0 for x drawn from p, and v of its variance Var_p[log p]; rare as [seen, expected, variance] of tokens with p(x) < 0.01; stop as [1 if the rollout stopped, the summed stop probability, its variance]. A record with reasoning split off from the response raises: its sampled sequence is not prompt + prefix + one text. quiet hides the progress bar."""
+    if bad := [(r["t"], r["i"]) for r in rollouts if r["raw"].get("reasoning")]:
+        raise ValueError(f"rollouts {bad[:3]} hold reasoning apart from the response, which calib_rollouts cannot score")
+    eos, dev, n_prompt, out = sorted(eos_ids(model)), next(model.parameters()).device, len(trace["prompt_ids"]), []
+    rollouts = sorted(rollouts, key=lambda r: r["t"] + len(r["ids"]))
+    for b in pbar(range(0, len(rollouts), batch_size), desc="calib", disable=quiet):
+        batch = rollouts[b:b + batch_size]
+        seqs = [trace["prompt_ids"] + trace["ids"][:r["t"]] + r["ids"] for r in batch]
+        logits = model(t.tensor([q + [0] * (len(seqs[-1]) - len(q)) for q in seqs], device=dev), return_type="logits")  # right padding: nothing a row is scored on can see it
+        for row, r in zip(logits, batch):
+            x, first, acc = t.tensor(r["ids"] + eos[-1:] * r["stopped"], device=dev), n_prompt + r["t"] - 1, t.zeros(7, dtype=t.float64)
+            for c in range(0, len(x), 100):  # 100 steps at a time, to bound the [steps, vocabulary] temporaries
+                xc = x[c:c + 100]
+                lp = row[first + c:first + c + len(xc)].float().log_softmax(-1)
+                lp[:, eos[-1]] = lp[:, eos].logsumexp(-1)  # the stop token: all eos ids as one
+                lp[:, eos[:-1]] = -1e9
+                p, lx = lp.exp(), lp[t.arange(len(xc)), xc]
+                H, a, ps = -(p * lp).sum(-1), (p * (p < 0.01)).sum(-1), p[:, eos[-1]]
+                acc += t.stack([(lx + H).sum(), ((p * lp * lp).sum(-1) - H * H).sum(), (lx < math.log(0.01)).sum(), a.sum(), (a * (1 - a)).sum(), ps.sum(), (ps * (1 - ps)).sum()]).double().cpu()
+            s, v, *rest = acc.tolist()
+            out.append({"t": r["t"], "i": r["i"], "n": len(x), "s": s, "v": v, "rare": rest[:3], "stop": [float(r["stopped"]), *rest[3:]]})
+    return out
+
+def calib_check(calib: list[dict], z_max: float = 3.0) -> dict:
+    """The fungibility check over calib_rollouts' output for one source: can its rollouts stand in for the local model's? Three z-scores, each standard normal for samples from the local model: tokens (sum s over the root of sum v; negative when the tokens are less probable than the model's own samples would be: a higher temperature, another model), rare (tokens under 1%, seen minus expected; negative under top-p or top-k truncation) and stops (seen minus expected; positive when the source ends responses where the model would not). flagged when any |z| exceeds z_max, which samples from the model meet about 0.8% of the time at 3. Also rollouts, tokens, mean_s (nats per token) and temperature, the temperature at which the model fits the tokens best, by one Newton step from 1.
+    Use: probe first, then about 150 rollouts through the provider, load_rollouts, calib_rollouts, calib_check. Measured on Llama-3.1-8B, Llama-3.2-3B, Qwen3.5-9B and Qwen3.8-27B against 11 provider deployments and 3 altered-sampling controls, at 150 rollouts: local rollouts are flagged 0.2 to 0.8% of the time, the 8 deployments whose P(correct) curve matches local at most 2%, every source 0.048 or more off on the curve at least 99.6%, and top-k and top-p truncation always.
+    Limits. A flag says the source does not sample as the local model does, not that an outcome differs: truncation is flagged and leaves P(correct) where it was, and the size of mean_s does not predict the size of an outcome gap. A pass at 150 rollouts does not rule out a small difference (a deployment 0.034 off on the curve passed at 150 and showed at 3,100), nor a shift in next-token probability at a single position (two deployments were 0.05 off at one close call with matching curves and scores: a branch an analysis depends on is tested with one-token samples there). Repeated or cached samples look like fresh ones. The evidence is one trace per model, with thinking off. ids recovered from a provider's text are not always the sampled ones (joint_ids), which did not move the scores of matching deployments."""
+    tot = lambda f: sum(f(c) for c in calib)
+    z = lambda d, var: d / math.sqrt(var) if var > 0 else math.copysign(math.inf, d) if d else 0.0
+    s, v, n = tot(lambda c: c["s"]), tot(lambda c: c["v"]), tot(lambda c: c["n"])
+    rare, stop = [tot(lambda c, j=j: c["rare"][j]) for j in range(3)], [tot(lambda c, j=j: c["stop"][j]) for j in range(3)]
+    zs = {"tokens": z(s, v), "rare": z(rare[0] - rare[1], rare[2]), "stops": z(stop[0] - stop[1], stop[2])}
+    return {"rollouts": len(calib), "tokens": n, "mean_s": s / n, "temperature": 1 + s / (2 * s - v), "z": zs, "flagged": any(abs(x) > z_max for x in zs.values())}
+
+def resample_curve(scores: list[dict] | dict[str, list[dict]], title: str = "", renderer=None, return_fig: bool = False):
+    """p over t with its interval as a band, from Resampler.scores, rollout_scores or estimate. A dict of named score lists draws one curve each (the methods, or the sources of one trace): four hues, then the same four dashed, and more than eight raises. The band is clipped to [0, 1], which the recursion's interval can leave. Hovering a point shows its counts and interval, and its token where the scores carry one."""
+    named = scores if isinstance(scores, dict) else {"": scores}
+    if len(named) > 2 * len(SERIES):
+        raise ValueError(f"{len(named)} curves, but there are {2 * len(SERIES)} styles: draw fewer per figure")
+    fig = go.Figure()
+    for j, (name, sc) in enumerate(named.items()):
+        color, ts = SERIES[j % len(SERIES)], [s["t"] for s in sc]
+        lo, hi = [max(s["ci"][0], 0.0) for s in sc], [min(s["ci"][1], 1.0) for s in sc]
+        hover = [(f"{name}: " if name else "") + f"t={s['t']}" + (f" {s['token']!r}" if "token" in s else "") + f"<br>p={s['p']:.2f} [{s['ci'][0]:.2f}, {s['ci'][1]:.2f}]<br>{s['k']}/{s['judged']} judged, {s['other']} other, {s['direct']} of {s['n']} sampled here" for s in sc]
+        fig.add_scatter(x=ts + ts[::-1], y=hi + lo[::-1], fill="toself", fillcolor=f"rgba({int(color[1:3], 16)},{int(color[3:5], 16)},{int(color[5:7], 16)},0.2)", line={"width": 0}, hoverinfo="skip", showlegend=False, legendgroup=name)
+        fig.add_scatter(x=ts, y=[s["p"] for s in sc], mode="lines+markers", line={"color": color, "dash": "solid" if j < len(SERIES) else "dash"}, text=hover, hoverinfo="text", name=name, legendgroup=name, showlegend=bool(name))
+    fig.update_layout(title=title, xaxis_title="prefix tokens t", yaxis_title="p", yaxis_range=[0, 1], **DARK)
     return fig if return_fig else fig.show(renderer=renderer)

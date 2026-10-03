@@ -59,7 +59,7 @@ def stream_rolling(model, prompt_toks: Tensor, n: int, batch_size: int, new_toks
     Save each sample as it arrives and a crash or interrupt keeps everything that finished; another call with the remaining n tops up. Samples come in completion order, so a run stopped early lacks up to batch_size samples that skew long, the rows in flight. The body runs when consumed, not when called: hooks, seed and grad contexts must enclose the consuming loop, and a generator kept but not exhausted keeps the batch's cache on the device."""
     eos, last, plen = eos_ids(model), prompt_toks[0, -1], prompt_toks.shape[1] - 1
     B = min(batch_size, n)
-    _, cache = model(prompt_toks[:, :-1].repeat(B, 1), return_type="logits_and_cache", use_cache=True)
+    cache = model(prompt_toks[:, :-1].repeat(B, 1), return_type="logits_and_cache", use_cache=True, logits_to_keep=1)[1]  # one position's logits: for every prompt token of every row they would be batch x prompt x vocabulary, kept for the whole run
     if other := [type(l).__name__ for l in cache.layers if type(l) not in (DynamicLayer, DynamicSlidingWindowLayer, LinearAttentionLayer)]:
         raise TypeError(f"stream_rolling cannot restart a row of a {other[0]} cache: it rewrites keys and values, or the conv and recurrent state, and that layer holds other per-row state")
     template = [(l.keys[0].clone(), l.values[0].clone()) if isinstance(l, DynamicLayer) else (l.conv_states[0][0].clone(), l.recurrent_states[0][0].clone()) for l in cache.layers]
@@ -108,7 +108,7 @@ def stream_rollouts(model, toks: Tensor, cuts: list[int], batch_size: int, max_l
     eos = t.tensor(sorted(eos_ids(model)), device=toks.device)
     if any(not 1 <= c <= toks.shape[1] or c >= max_len for c in cuts):
         raise ValueError(f"cuts must lie in 1..{toks.shape[1]}, the length of toks, and below max_len; got cuts in {min(cuts)}..{max(cuts)} with max_len {max_len}")
-    _, full = model(toks[:, :-1], return_type="logits_and_cache", use_cache=True)
+    full = model(toks[:, :-1], return_type="logits_and_cache", use_cache=True, logits_to_keep=1)[1]
     if other := [type(l).__name__ for l in full.layers if type(l) is not DynamicLayer]:
         raise TypeError(f"a {other[0]} cache cannot be cut back to a prefix: stream_rollouts needs full attention in every layer")
     kv = [(l.keys[0], l.values[0]) for l in full.layers]  # per layer [heads, seq - 1, d]: the entries every row is cut from

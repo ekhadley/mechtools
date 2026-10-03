@@ -171,6 +171,17 @@ resample_curve(rs.scores("match"))
 
 The same estimators are `estimate(T, rollouts, method)` over `(t, k, outcome)` triples from anywhere, with k the number of the text's next tokens the rollout reproduced: rollouts of a local model from `sampling.stream_rollouts`, for instance. Reuse and the recursion are exact only when a rollout's distribution does not depend on where it was cut, so the length cap must rarely bind: `Resampler` counts its max_tokens from the cut, and `sampling.stream_rollouts` caps the total length for that reason.
 
+Rollouts sampled locally and through a provider read the same way. A trace is a dict with `prompt`, `prompt_ids`, `ids` and `cap`, and each source's rollouts sit in their own jsonl: local records hold `t`, `i`, `ids` and `ended`, and a `Resampler`'s file is read as it is.
+
+```python
+local = load_rollouts(trace, "run/trace_local.jsonl", tok)     # t, i, ids, text, stopped, capped, k (the reuse count), tokens, verdict fields, raw
+api = load_rollouts(trace, "run/trace_chutes.jsonl", tok)
+resample_curve({"local": rollout_scores(trace, local, tok), "chutes": rollout_scores(trace, api, tok)})
+calib_check(calib_rollouts(model, trace, api))                 # do the provider's rollouts look like samples from the local model?
+```
+
+`calib_rollouts` scores every sampled token of every rollout against a forward pass of the local model, and `calib_check` turns the scores into three z-scores (token surprise, rare tokens, stops), a best-fit temperature and a flag. About 150 rollouts are enough to catch a provider that samples at another temperature, truncates, or stops early; its docstring says what a pass does not cover.
+
 This only works when the provider feeds the model exactly the string you send, and nothing in a response says whether it did. Run `probe(tok, model_id, render)` on the model's endpoints first; it costs a few cents and reports which providers pass the prompt through verbatim. The `mechtools.resample` module docstring is the full checklist of what to verify and what each failure looks like. Read it before spending money.
 
 ### `models`
@@ -185,7 +196,7 @@ This only works when the provider feeds the model exactly the string you send, a
 
 ### `plots`
 
-`imshow`, `line`, `scatter`, `bar`, `hist`: plotly wrappers that take tensors, arrays or lists directly, plus `renderer` and `return_fig`. `to_numpy` converts anything tensor-like. `plot_vocab_umap` scatters a subset of token vectors colored by cluster.
+`imshow`, `line`, `scatter`, `bar`, `hist`: plotly wrappers that take tensors, arrays or lists directly, plus `renderer` and `return_fig`. `DARK`, `SERIES` and `write_dark_html` are the dark style the resampling curves use: `fig.update_layout(**DARK)`. `to_numpy` converts anything tensor-like. `plot_vocab_umap` scatters a subset of token vectors colored by cluster.
 
 ## Tests
 

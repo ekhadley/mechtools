@@ -38,7 +38,8 @@ DOCS = [(README, "## Modules", re.compile(r"^### `(\w+)`\n(.*?)(?=^### |\Z)", re
 @pytest.mark.skipif(not README.exists(), reason="README.md is only next to an editable install")
 def test_doc_names_exist():
     """Every backticked identifier in the README's module sections and in CLAUDE.md's module details table names something in that module (a function, class, method or parameter), so renames update the docs."""
-    prose = {"HookedTransformer", "TransformerBridge", "text", "reasoning", "response", "finish_reason", "prompt_tokens", "completion_tokens", "cost", "raw", "cfg", "direct", "reasoning_content", "error", "enable_thinking", "OPENROUTER_API_KEY", "naive", "recursion"}  # classes from other packages, fields of flat, rollout and scores records and of messages, a finish_reason value, a template kwarg, the key's variable, values of scores' method
+    prose = {"HookedTransformer", "TransformerBridge", "text", "reasoning", "response", "finish_reason", "prompt_tokens", "completion_tokens", "cost", "raw", "cfg", "direct", "reasoning_content", "error", "enable_thinking", "OPENROUTER_API_KEY", "naive", "recursion", "token",
+             "prompt_ids", "ids", "cap", "ended", "stopped", "capped", "tokens", "k", "n", "s", "v", "rare", "mean_s", "temperature", "flagged"}  # classes from other packages, fields of flat, rollout and scores records and of messages, a finish_reason value, a template kwarg, the key's variable, values of scores' method; fields of a trace, of load_rollouts' and calib_rollouts' records and of calib_check's result
     for path, heading, pattern in DOCS:
         for name, body in pattern.findall(path.read_text().split(heading)[1].split("\n## ")[0]):
             body = re.sub(r"```.*?```", "", body, flags=re.S)  # code blocks are examples, not names

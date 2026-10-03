@@ -100,3 +100,9 @@ def test_uniform_interface_and_lazy_umap():
         params = inspect.signature(f).parameters
         assert "return_fig" in params and "renderer" in params, f.__name__
     assert not hasattr(plots, "umap")  # imported inside plot_vocab_umap: its numba compilation is most of the package's import time
+
+def test_dark_style(tmp_path):
+    fig = go.Figure(go.Scatter(x=[0, 1], y=[0, 1], line={"color": SERIES[0]})).update_layout(**DARK)
+    write_dark_html(fig, str(tmp_path / "f.html"))
+    assert fig.layout.paper_bgcolor == fig.layout.plot_bgcolor == "#1a1a19" and "<head><style>html, body { background: #1a1a19; margin: 0; }</style>" in open(tmp_path / "f.html").read()
+    assert len(SERIES) == len(set(SERIES)) == 4 and all(c.startswith("#") and len(c) == 7 for c in SERIES)
