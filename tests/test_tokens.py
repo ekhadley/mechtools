@@ -66,7 +66,7 @@ def test_toks_html():
     h = toks_html(list("abcdefg"), lo=2, hi=5)
     assert h.count("<span") == 3 and "… " in h and " …" in h
     h = toks_html(list("abcdefg"), pos=[3, -1])
-    assert h.count("<span data-p=") == 2 and "<span data-p=0 title='3" in h and "<span data-p=1 title='6" in h and "border-bottom:2px solid #e66" not in h
+    assert h.count("<span data-p=") == 2 and "<span data-p=0 data-h='pos 3" in h and "<span data-p=1 data-h='pos 6" in h and "border-bottom:2px solid #e66" not in h
     assert "<span" not in toks_html([], pos=-1) and "<span" not in toks_html([], pos=[0])  # no tokens: no crash
 
 def test_toks_html_vals():

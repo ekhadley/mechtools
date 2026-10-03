@@ -31,8 +31,8 @@ def shown(monkeypatch):
 
 def test_token_strip_marks_positions():
     h = token_strip(TOKS, pos=[5, 12], ctx=3)
-    assert h.count("<span data-p=") == 2 and "<span data-p=0 title='5" in h and "<span data-p=1 title='12" in h
-    assert "title='2 " in h and "title='15 " in h and "title='1 " not in h and "title='16 " not in h  # window is min(pos)-ctx to max(pos)+ctx
+    assert h.count("<span data-p=") == 2 and "<span data-p=0 data-h='pos 5" in h and "<span data-p=1 data-h='pos 12" in h
+    assert "data-h='pos 2 " in h and "data-h='pos 15 " in h and "data-h='pos 1 " not in h and "data-h='pos 16 " not in h  # window is min(pos)-ctx to max(pos)+ctx
     h = token_strip(TOKS, pos=7, ctx=3)
     assert "<span data-p" not in h and h.count("border-bottom:2px solid #e66") == 1
 
@@ -91,7 +91,7 @@ def test_show_logits_inputs(shown):
     with pytest.raises(ValueError, match="needs input_src"):
         show_logits(None, logits=t.randn(3, 8), tokenizer=tok)
     show_logits([3, 1, 4], logits=t.randn(1, 3, 8), tokenizer=tok, pos=[-1], k=2)
-    assert shown[-1].count("class='pane'") == 1 and "data-p=0 title='2" in shown[-1] and "<h3" in shown[-1]
+    assert shown[-1].count("class='pane'") == 1 and "data-p=0 data-h='pos 2" in shown[-1] and "<h3" in shown[-1]
     show_logits("one two", model=FakeModel(), k=2, title=None)  # a string is tokenized (with BOS) and run through the model
     assert shown[-1].count("class='pane'") == 3 and "<h3" not in shown[-1]
     show_logits(["a", "b"], logits=t.randn(2, 8), tokenizer=tok)  # str tokens with logits: no ids, so no next-token coloring
@@ -150,7 +150,7 @@ def test_cluster_tables_and_readout(shown):
     nested = cluster_readout({"L0": {2: scores, 7: -scores}}, {"L0": labels}, names, n_clusters=2, n_rows=3, input_src=TOKS)
     assert list(nested["L0"]) == [2, 7] and nested["L0"][2] == shown_ids["L0"]
     h = shown[-1]
-    assert h.count("class='pane'") == 2 and h.count("data-p=") == 2 and "<button>p2</button><button>p7</button>" in h and "<span data-p=1 title='7" in h
+    assert h.count("class='pane'") == 2 and h.count("data-p=") == 2 and "<button>p2</button><button>p7</button>" in h and "<span data-p=1 data-h='pos 7" in h
 
 def test_lens_readouts_with_fake_cache(shown):
     d = 4
