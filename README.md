@@ -73,6 +73,16 @@ for sample in stream_rolling(model, ids, n=2000, batch_size=64, new_toks=512):
 
 A returned sample of length `new_toks` hit the cap without stopping.
 
+- `stream_rollouts`: continuations of one text from many cut positions, for resampling a local model. `cuts[i]` is how many tokens of `toks` rollout i keeps, prompt included. One forward over the text, then every rollout starts from a right-aligned slice of that cache, so no prefix is recomputed; rows run in batches from the longest cut down and leave their batch as they finish, and samples arrive in completion order as `(i, sample)`. `max_len` caps every row at the same total length wherever it was cut, so a rollout's distribution does not depend on its cut; a sample of `max_len - cuts[i]` tokens hit it. Full-attention models only. Since the long rollouts of a position are the ones still running when a run dies, save a position's rollouts together once all of them are in, not one by one, or a resumed pool is biased toward short continuations there.
+
+```python
+cuts = [n_prompt + t for t in range(T + 1) for _ in range(10)]   # 10 rollouts from every position of a T-token response after an n_prompt-token prompt
+for i, sample in stream_rollouts(model, ids, cuts, batch_size=64, max_len=n_prompt + 1024):
+    out.write(json.dumps({"t": cuts[i] - n_prompt, "ids": sample}) + "\n")
+```
+
+`resample.estimate` turns such records into the curve; see that section.
+
 ### `hooks`
 
 Hook functions for `model.hooks(fwd_hooks=...)` and `model.run_with_hooks`.
@@ -157,7 +167,9 @@ resample_curve(rs.scores("match"))
 
 `judge` is an async function from a rollout record to a dict of fields to store with it; `scores(key)` reads one of those keys. Rollouts append to a jsonl as they finish and verdicts to a sidecar next to it, so a judge outage costs nothing: the next `fill` judges what is pending. Loading the file checks every record against the instance's configuration, so runs cannot be mixed.
 
-`scores` counts a rollout at every position it carries the text through: a continuation from t that reproduces the text's next k tokens is a sample from t + k as well, exactly. On a 165-token math response that gave 7.9 effective samples per rollout, which is why a stride of 1 at a small count per position beats a coarse grid at a large one, and why `deficit` measures its floor and interval on the effective counts.
+`scores(key, method)` has three estimators. `reuse` (the default) counts a rollout at every position it carries the text through: a continuation from t that reproduces the text's next k tokens is a sample from t + k as well, exactly. On a 165-token math response that gave 7.9 effective samples per rollout, which is why a stride of 1 at a small count per position beats a coarse grid at a large one, and why `deficit` measures its floor and interval on the effective counts. `recursion` reads the same counts backward from the end, p(t) = q p(t+1) + (1 - q) r with q the share of rollouts at t that continue with the text's next token and r the hit rate of those that leave, so rollouts sampled after t inform p(t) too; on math traces it needs about half the tokens of reuse at equal error, with a calibrated interval. `naive` uses only the rollouts sampled at t.
+
+The same estimators are `estimate(T, rollouts, method)` over `(t, k, outcome)` triples from anywhere, with k the number of the text's next tokens the rollout reproduced: rollouts of a local model from `sampling.stream_rollouts`, for instance. Reuse and the recursion are exact only when a rollout's distribution does not depend on where it was cut, so the length cap must rarely bind: `Resampler` counts its max_tokens from the cut, and `sampling.stream_rollouts` caps the total length for that reason.
 
 This only works when the provider feeds the model exactly the string you send, and nothing in a response says whether it did. Run `probe(tok, model_id, render)` on the model's endpoints first; it costs a few cents and reports which providers pass the prompt through verbatim. The `mechtools.resample` module docstring is the full checklist of what to verify and what each failure looks like. Read it before spending money.
 

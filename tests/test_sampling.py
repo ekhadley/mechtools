@@ -2,8 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch as t
-from transformers import Gemma3ForCausalLM, Gemma3TextConfig, Qwen3_5ForCausalLM, Qwen3_5TextConfig
-from transformers.cache_utils import DynamicCache, DynamicLayer, DynamicSlidingWindowLayer, LinearAttentionLayer
+from transformers import DeepseekV4Config, DeepseekV4ForCausalLM, Gemma3ForCausalLM, Gemma3TextConfig, GlmMoeDsaConfig, GlmMoeDsaForCausalLM, Qwen3_5ForCausalLM, Qwen3_5TextConfig, ZayaConfig, ZayaForCausalLM
+from transformers.cache_utils import DynamicCache, DynamicIndexedLayer, DynamicLayer, DynamicSlidingWindowLayer, LinearAttentionAndFullAttentionLayer, LinearAttentionAndSlidingWindowAttentionLayer, LinearAttentionLayer
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4CSACache, DeepseekV4HCACache
 
 from mechtools import set_seed
 from mechtools.sampling import *
@@ -126,6 +127,11 @@ RANDOM_MODELS = {  # built from a config, so nothing is downloaded. The outer la
     DynamicSlidingWindowLayer: lambda: Gemma3ForCausalLM(Gemma3TextConfig(**TINY, sliding_window=8, layer_types=["sliding_attention", "full_attention", "sliding_attention"])),
     LinearAttentionLayer: lambda: Qwen3_5ForCausalLM(Qwen3_5TextConfig(**TINY, linear_key_head_dim=4, linear_value_head_dim=4, linear_num_key_heads=2, linear_num_value_heads=4, layer_types=["linear_attention", "full_attention", "linear_attention"])),
 }
+UNSUPPORTED = [  # also built from configs: cache layers that pass the isinstance checks of a restart but hold per-row state beyond keys, values, conv and recurrent states. The expected layer types, and the model: sparse attention with indexer keys in every layer; hybrid layers holding keys and values beside a conv and a recurrent state; DeepSeek-V4's compressed-attention caches with compressor buffers and a batch-wide entry count
+    ([DynamicIndexedLayer] * 3, lambda: GlmMoeDsaForCausalLM(GlmMoeDsaConfig(vocab_size=V, hidden_size=16, intermediate_size=32, moe_intermediate_size=8, num_hidden_layers=3, num_attention_heads=2, num_key_value_heads=2, n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1, kv_lora_rank=8, q_lora_rank=8, qk_rope_head_dim=4, qk_nope_head_dim=4, v_head_dim=4, index_topk=4, index_head_dim=4, index_n_heads=2, first_k_dense_replace=1, max_position_embeddings=128))),
+    ([LinearAttentionAndFullAttentionLayer, LinearAttentionAndSlidingWindowAttentionLayer, LinearAttentionAndFullAttentionLayer], lambda: ZayaForCausalLM(ZayaConfig(vocab_size=V, hidden_size=16, num_hidden_layers=3, num_attention_heads=2, num_key_value_heads=1, head_dim=8, moe_intermediate_size=8, num_experts=4, router_hidden_size=8, max_position_embeddings=128, sliding_window=8, eos_token_id=1, layer_types=["hybrid", "hybrid_sliding", "hybrid"]))),
+    ([DeepseekV4HCACache, DeepseekV4CSACache, DeepseekV4HCACache], lambda: DeepseekV4ForCausalLM(DeepseekV4Config(vocab_size=V, hidden_size=16, moe_intermediate_size=8, num_hidden_layers=3, num_attention_heads=2, num_key_value_heads=1, head_dim=8, q_lora_rank=8, num_experts_per_tok=2, n_routed_experts=4, n_shared_experts=1, sliding_window=8, o_groups=2, o_lora_rank=4, index_n_heads=2, index_head_dim=4, index_topk=4, hc_mult=2, compress_rates={"compressed_sparse_attention": 2, "heavily_compressed_attention": 4}, layer_types=["heavily_compressed_attention", "compressed_sparse_attention", "heavily_compressed_attention"], max_position_embeddings=128, num_nextn_predict_layers=0))),
+]
 
 def test_eos_ids():
     assert eos_ids(FakeModel()) == {EOS, EOS2}
@@ -249,3 +255,97 @@ def test_rolling_matches_uncached_forward_on_other_cache_layers(layer, prompt_le
     model = AsBridge(RANDOM_MODELS[layer]().eval().requires_grad_(False))
     m, out = check_rolling(model, t.randint(8, V, (1, prompt_len)), range(1, V, 6), n=40, new_toks=16)
     assert [type(l) for l in m.cache.layers] == [layer, DynamicLayer, layer] and len({len(r) for r in out}) > 4
+
+@pytest.mark.parametrize("types,build", UNSUPPORTED, ids=["glm_moe_dsa", "zaya", "deepseek_v4"])
+def test_stream_rolling_refuses_cache_layers_it_cannot_restart(types, build):
+    """The TypeError names the layer and comes right after the prefill, before any row is sampled."""
+    prompt = t.randint(8, V, (1, 6))
+    m = Checked(AsBridge(build().eval().requires_grad_(False)), prompt, [1])
+    with pytest.raises(TypeError, match=f"{types[0].__name__} cache"):
+        next(stream_rolling(m, prompt, n=8, batch_size=4, new_toks=8, quiet=True))
+    assert [type(l) for l in m.cache.layers] == types and m.widths == []
+
+def check_rollouts(out: dict[int, list[int]], toks: t.Tensor, cuts: list[int], max_len: int):
+    """Every cut came back once, and each sample continues its cut's prefix as FakeModel's rule dictates, holds no eos, and stays within the cap."""
+    assert sorted(out) == list(range(len(cuts)))
+    for i, row in out.items():
+        assert row == expected(toks[:, :cuts[i]], max_len)[:len(row)] and EOS not in row and EOS2 not in row and len(row) <= max_len - cuts[i]
+
+@pytest.mark.parametrize("cuts,bs,max_len,p_eos,quiet", [([4, 1, 3, 4, 2, 3, 1], 3, 12, 0.25, False), ([4, 4, 4], 5, 10, 0.0, True), ([2, 3], 1, 4, 0.0, False), ([1], 4, 5, 0.0, True), (list(range(1, 5)) * 5, 4, 14, 0.3, True)])
+def test_stream_rollouts(cuts, bs, max_len, p_eos, quiet, capsys):
+    m = FakeModel(p_eos=p_eos, seed=len(cuts))
+    out = dict(stream_rollouts(m, PROMPT, cuts, bs, max_len, quiet=quiet))
+    check_rollouts(out, PROMPT, cuts, max_len)
+    assert m.violations == [], m.violations[:3]
+    assert m.calls[0] == (1, 0) and max(B for B, _ in m.calls[1:]) == min(bs, len(cuts))  # one forward over the prompt less its last token, then batches
+    assert ("rollouts" in capsys.readouterr().err) != quiet
+    if p_eos == 0.0:
+        assert all(len(out[i]) == max_len - cuts[i] for i in out)  # every row runs to the cap
+
+def test_stream_rollouts_order():
+    """Batches go from the longest cut down, and within a batch the rows that finish first come first."""
+    m = FakeModel(p_eos=0.0)
+    assert [i for i, _ in stream_rollouts(m, PROMPT, [1, 4, 2, 4, 3], 2, 8, quiet=True)] == [1, 3, 4, 2, 0]  # the two cuts at 4 (four tokens each), then the cut at 3 before the one at 2, then the cut at 1 alone
+    assert [B for B, _ in m.calls] == [1] + [2] * 4 + [2] * 5 + [1] + [1] * 7  # the second batch loses its cut-3 row after five steps and runs one more; the last batch is one row for seven steps
+    assert m.violations == []
+
+def test_stream_rollouts_random_configs():
+    g = t.Generator().manual_seed(0)
+    for _ in range(60):
+        prompt_len, n, bs, extra = (int(t.randint(lo, hi, (1,), generator=g)) for lo, hi in ((2, 10), (1, 40), (1, 9), (1, 13)))
+        prompt, cuts = t.arange(9, 9 + prompt_len)[None], (t.randint(1, prompt_len + 1, (n,), generator=g)).tolist()
+        m = FakeModel(p_eos=float(t.rand(1, generator=g)) / 2, seed=n)
+        out = dict(stream_rollouts(m, prompt, cuts, bs, prompt_len + extra, quiet=True))
+        check_rollouts(out, prompt, cuts, prompt_len + extra)
+        assert m.violations == [], (prompt_len, cuts, bs, extra, m.violations[:3])
+
+def test_stream_rollouts_rejects_bad_cuts():
+    for cuts, max_len in (([0, 2], 10), ([5], 10), ([2, 4], 4)):  # below 1, past the end, not below max_len
+        with pytest.raises(ValueError, match="cuts"):
+            next(stream_rollouts(FakeModel(), PROMPT, cuts, 2, max_len, quiet=True))
+
+@pytest.mark.parametrize("layer", [DynamicSlidingWindowLayer, LinearAttentionLayer])
+def test_stream_rollouts_refuses_other_cache_layers(layer):
+    model = AsBridge(RANDOM_MODELS[layer]().eval().requires_grad_(False))
+    with pytest.raises(TypeError, match="cannot be cut back"):
+        next(stream_rollouts(model, t.randint(8, V, (1, 6)), [3, 6], 2, 20, quiet=True))
+
+class CheckedRollouts:
+    """Wraps a model in the Bridge call shape and checks every step of stream_rollouts: the mask as wide as the cache plus one and as the longest row's position plus one, and each row's logits against an uncached forward over the tokens it holds, which are its cut's prefix (the position of the first token it feeds, plus one, tokens of toks) and the tokens fed since. gap is the largest difference seen. eos, when given, replaces the model's eos ids."""
+    def __init__(self, model, toks, eos=None):
+        self.model, self.tokenizer, self.toks, self.gap, self.cache = model, model.tokenizer, toks[0].tolist(), 0.0, None
+        self.generation_config = model.generation_config if eos is None else SimpleNamespace(eos_token_id=list(eos))
+
+    def __call__(self, toks, return_type=None, past_key_values=None, **kw):
+        if past_key_values is None:  # the one forward over the text
+            return self.model(toks, return_type=return_type, **kw)
+        if past_key_values is not self.cache:  # a new batch: each row holds its cut's prefix
+            self.cache, self.rows = past_key_values, [self.toks[:c] for c in kw["position_ids"][:, 0].tolist()]
+            def reorder(keep, hf_reorder=self.cache.reorder_cache):
+                hf_reorder(keep)
+                self.rows = [self.rows[i] for i in keep.tolist()]
+            self.cache.reorder_cache = reorder
+        S = kw["attention_mask"].shape[1] - 1
+        assert S == int(kw["position_ids"].max()) == self.cache.get_seq_length() == max(l.keys.shape[2] for l in self.cache.layers)
+        logits, cache = self.model(toks, return_type=return_type, past_key_values=past_key_values, **kw)
+        assert cache is self.cache
+        for b, tok in enumerate(toks[:, 0].tolist()):
+            self.rows[b].append(tok)
+            ref = self.model(t.tensor([self.rows[b]]), return_type="logits")[0, -1]
+            self.gap = max(self.gap, (logits[b, -1] - ref).abs().max().item())
+        return logits, cache
+
+@pytest.mark.hf
+def test_rollouts_match_uncached_forward_on_the_bridge(tiny_bridge):
+    set_seed(0)
+    ids = t.tensor([tiny_bridge.tokenizer.encode("Hello there, how are you")])
+    cuts = list(range(1, ids.shape[1] + 1)) * 3  # every cut three times, including the first token alone and the whole text
+    m = CheckedRollouts(tiny_bridge, ids, range(0, 32000, 8))  # an eighth of the vocab ends a row, so rows end at varied lengths
+    out = dict(stream_rollouts(m, ids, cuts, 4, ids.shape[1] + 10, quiet=True))
+    assert sorted(out) == list(range(len(cuts))) and m.gap < 1e-5 and len({len(r) for r in out.values()}) > 4
+    assert all(len(out[i]) <= ids.shape[1] + 10 - cuts[i] and not (set(out[i]) & set(range(0, 32000, 8))) for i in out)
+    set_seed(0)
+    a = sample_batch(tiny_bridge, ids, n=3, new_toks=6, quiet=True)
+    set_seed(0)
+    b = dict(stream_rollouts(tiny_bridge, ids, [ids.shape[1]] * 3, 3, ids.shape[1] + 6, quiet=True))
+    assert [b[i] for i in range(3)] == a  # three rollouts cut at the end are three samples of the prompt, drawing the same random numbers

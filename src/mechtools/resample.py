@@ -14,6 +14,7 @@ The model continues the CoT only if the provider feeds it exactly the rendered p
 import asyncio
 import hashlib
 import json
+import math
 import os
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable
@@ -31,13 +32,46 @@ ROLLOUT_KEYS = {"t", "i", "reasoning", "response", "finish_reason", "provider", 
 def _sha(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()[:16]
 
+def estimate(T: int, rollouts: list[tuple[int, int, bool | None]], method: str = "reuse") -> list[dict]:
+    """P(outcome | the first t tokens of a T-token text) at every position with samples, sorted by t, from rollouts given as (t, k, outcome): sampled from t, continuing with the text's next k tokens before departing from it (k = T - t when it reproduces the rest), and the outcome True, False, or None for no verdict. Per position: t, n samples, direct (the rollouts sampled at t itself), k with outcome True, judged (True or False), other (the rest), p and ci. method:
+      naive      the rollouts sampled at t; p = k / judged, Wilson ci.
+      reuse      a rollout counts at every position through t + k: conditional on producing the text's next k tokens, the rest of it is drawn from the model at t + k, exactly. n is then the effective count, and positions never sampled directly appear; p = k / judged, Wilson ci.
+      recursion  the reuse counts read backward from the end: p(t) = q p(t+1) + (1 - q) r, with q the share of the judged rollouts on the text at t that continue with its next token and r the rate of True among those that depart there, so what the rollouts sampled after t say about p(t+1) reaches p(t); p(T) is the rate over everything that gets there. The ci is p +- 1.96 sd, where the variance counts the departures' r(1 - r) with r shrunk toward 1/2 (as (hits + 1) / (departures + 2)), so one departing rollout does not read as certainty, the spread between p(t+1) and r, and q^2 times the variance of p(t+1). The interval is not clipped to [0, 1]. Rollouts without a verdict are left out of this estimate, where the other two count them as other.
+    Positions no rollout reaches are absent from the output; the recursion runs through such a gap unchanged, since every rollout before it departs before it. Reuse and the recursion are exact only when a rollout's distribution does not depend on where it was cut, so a length cap must rarely bind (Resampler counts max_tokens from the cut; sampling.stream_rollouts caps the total length). Measured on math traces, the recursion needs about half the tokens of reuse at equal error and the reuse about a quarter of naive at stride 1."""
+    if method not in ("naive", "reuse", "recursion"):
+        raise ValueError(f"method must be naive, reuse or recursion, not {method!r}")
+    vals, direct, leave = defaultdict(list), Counter(), defaultdict(list)  # per position: the outcome of every rollout on the text there; the rollouts sampled there; the outcome of every rollout that departs there (at T, everything that gets there)
+    for t, k, y in rollouts:
+        if method == "naive":
+            k = 0
+        direct[t] += 1
+        for s in range(t, t + k + 1):
+            vals[s].append(y)
+        leave[t + k].append(y)
+    out = {t: {"t": t, "n": len(v), "direct": direct[t], "k": v.count(True), "judged": v.count(True) + v.count(False), "other": len(v) - v.count(True) - v.count(False)} for t, v in vals.items()}
+    for s in out.values():
+        s["p"], s["ci"] = s["k"] / s["judged"] if s["judged"] else float("nan"), wilson(s["k"], s["judged"])
+    if method == "recursion":
+        p, v = [float("nan")] * (T + 2), [float("nan")] * (T + 2)
+        for t in range(T, -1, -1):
+            if t not in out or not out[t]["judged"]:
+                continue
+            n, dep, hit = out[t]["judged"], leave[t].count(True) + leave[t].count(False), leave[t].count(True)
+            m, r, rs = dep / n, hit / max(dep, 1), (hit + 1) / (dep + 2)  # the share departing at t, their rate of True, and that rate shrunk for the variance
+            p[t], v[t] = m * r, m * rs * (1 - rs) / n
+            if m < 1:  # some continue to t + 1, so that estimate carries them, and the gap between staying and departing adds variance
+                p[t] += (1 - m) * p[t + 1]
+                v[t] += (1 - m) ** 2 * v[t + 1] + m * (1 - m) * (p[t + 1] - r) ** 2 / n
+            out[t]["p"], out[t]["ci"] = p[t], (p[t] - 1.96 * math.sqrt(v[t]), p[t] + 1.96 * math.sqrt(v[t]))
+    return [out[t] for t in sorted(out)]
+
 class Resampler:
     """Resamples text (a CoT, or a reasoning-off response) from token position t: the provider continues prompt + the first t tokens of text through raw /completions, so prompt must be the rendered chat template ending inside the open think or text block, and provider must pass raw prompts through verbatim: run probe first, and read the module docstring for the rest of the checklist. text is tokenized after the prompt, as the model produced it, and must not merge into the prompt's last token. Each rollout checks the provider's prompt_tokens against the local count of the exact string sent (on the response call too) and raises otherwise.
     Rollouts append to the jsonl at path, one per line: t, i, reasoning, response, finish_reason, provider, prompt_tokens, completion_tokens, cost, cfg (the configuration stamp: model, provider, stop, response_open, kw, hashes of prompt and text), raw (the response bodies, one per call). Verdicts append to the sidecar next to it (path with .judged.jsonl in place of .jsonl), one line per judged rollout: t, i, plus whatever judge(rollout) returns, which may not reuse the rollout's names; loading merges them into the records, so a rollout in memory carries its verdict's fields. judge is async (awaited) and receives only the record; response is the continuation only, so when text is a response, a judge that needs the whole response rebuilds it as resampler.prefix(rollout["t"]) + rollout["response"]. The judge is called on every rollout, including empty and truncated ones, and decides what to return for them (None or a missing key counts as other in scores).
     A rollout is on disk before it is judged, so a judge outage costs nothing: fill judges every unjudged rollout after sampling, and judge_pending does the same on its own. A judge that raises RequestFailed leaves its rollout unjudged for the next pass; any other exception from the judge stops the pass. A file whose records carry verdict fields inline (an older format) loads as judged.
     Loading a file checks every record's token counts and stamp against the instance and raises on a mismatch, so two configurations cannot be mixed in one file.
     A provider that returns reasoning and response merged (Together) needs stop at the end-of-reasoning token and response_open, the string that opens the response block: each rollout is then two calls. kw goes to complete: max_tokens (covering reasoning plus response), temperature, top_p and top_k (pass them explicitly), timeout, ...
-    Which positions to sample and how many is up to the caller: fill({t: count}) tops up the deficit at each position, so a strided grid is one call, and deficit(eps) is the next round of an early-stopping scheme. scores counts every rollout at each position it carries the text through (reuse): a rollout from t whose continuation starts with the text's next k tokens is a sample from t + k as well, so a stride-1 grid at a small count per position is the grid to use."""
+    Which positions to sample and how many is up to the caller: fill({t: count}) tops up the deficit at each position, so a strided grid is one call, and deficit(eps) is the next round of an early-stopping scheme. scores(key, method) is estimate over the rollouts: with reuse (the default) every rollout counts at each position it carries the text through, since a rollout from t whose continuation starts with the text's next k tokens is a sample from t + k as well, and the recursion reads those counts backward from the end so that later rollouts inform earlier positions; either way a stride-1 grid at a small count per position is the grid to use."""
 
     def __init__(self, tokenizer, prompt: str, text: str, path: str, model: str, provider: str, judge: Callable[[dict], Awaitable[dict]] | None = None, stop: str | None = None, response_open: str = "", **kw):
         self.tok, self.prompt, self.path, self.model, self.provider, self.judge, self.stop, self.response_open, self.kw = tokenizer, prompt, path, model, provider, judge, stop, response_open, kw
@@ -178,21 +212,15 @@ class Resampler:
                     k += 1
             self._reuse[t, r["i"]] = k
 
-    def scores(self, key: str = "match", reuse: bool = True) -> list[dict]:
-        """Per position with samples, sorted by t: n samples, direct (the rollouts sampled at t itself), k with key True, judged (True or False), other (None or missing, so unjudged rollouts too), p = k / judged, ci (Wilson), token (the one ending the prefix). With reuse, a rollout counts at every position through t + self.reuse(rollout), so n is the effective count and positions never sampled directly appear, including those fill skips."""
-        vals, direct = defaultdict(list), Counter()
-        if reuse:
+    def scores(self, key: str = "match", method: str = "reuse") -> list[dict]:
+        """estimate over the rollouts on disk, with the outcome read from key (a verdict field; None or missing, so unjudged rollouts too, counts as other), plus each position's token (the one ending the prefix). With reuse or the recursion, a rollout counts at every position through t + self.reuse(rollout), so n is the effective count and positions never sampled directly appear, including those fill skips."""
+        if method != "naive":
             self._reuse_fill([r for r in self.rollouts if (r["t"], r["i"]) not in self._reuse])
-        for r in self.rollouts:
-            direct[r["t"]] += 1
-            for t in range(r["t"], r["t"] + (self.reuse(r) if reuse else 0) + 1):
-                vals[t].append(r.get(key))
         if pending := sum((r["t"], r["i"]) not in self.judged for r in self.rollouts):
             print(f"  {yellow}{pending} rollouts are not judged yet and count as other{endc}")
-        out = []
-        for t in sorted(vals):
-            k, judged = vals[t].count(True), vals[t].count(True) + vals[t].count(False)
-            out.append({"t": t, "token": self.tok.decode(self.ids[t - 1:t]) if t else "", "n": len(vals[t]), "direct": direct[t], "k": k, "judged": judged, "other": len(vals[t]) - judged, "p": k / judged if judged else float("nan"), "ci": wilson(k, judged)})
+        out = estimate(len(self.ids), [(r["t"], self.reuse(r) if method != "naive" else 0, r.get(key)) for r in self.rollouts], method)
+        for s in out:
+            s["token"] = self.tok.decode(self.ids[s["t"] - 1:s["t"]]) if s["t"] else ""
         return out
 
     def deficit(self, eps: float, key: str = "match", positions: list[int] | None = None, batch: int = 5, n_min: int = 0, n_max: int | None = None) -> dict[int, int]:

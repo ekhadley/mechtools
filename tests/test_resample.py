@@ -6,6 +6,7 @@ import math
 import os
 import weakref
 
+import numpy as np
 import pytest
 from conftest import load_tokenizer
 
@@ -223,7 +224,11 @@ def test_reuse(tok, tmp_path, monkeypatch):
     sc = res.scores()
     assert [(s["t"], s["n"], s["direct"], s["k"]) for s in sc[:5]] == [(10, 3, 3, 2), (11, 2, 0, 2), (12, 2, 0, 2), (13, 2, 0, 2), (14, 1, 0, 1)] and len(sc) == 45 and sc[-1]["t"] == 54  # 51, which cannot be sampled, is covered
     assert sc[0]["ci"] == wilson(2, 3) and sc[1]["p"] == 1.0 and sc[1]["ci"] == wilson(2, 2)
-    assert [(s["t"], s["n"], s["direct"]) for s in res.scores(reuse=False)] == [(10, 3, 3)]
+    assert [(s["t"], s["n"], s["direct"]) for s in res.scores(method="naive")] == [(10, 3, 3)]
+    rc = res.scores(method="recursion")  # at 10 one of three departs with False: p = 2/3 of p(11); from 11 on, every rollout on the text continues or departs with True
+    assert [s["t"] for s in rc] == [s["t"] for s in sc] and rc[0]["p"] == pytest.approx(2 / 3) and all(s["p"] == 1.0 for s in rc[1:]) and rc[0]["ci"] == pytest.approx((2 / 3 - 1.96 * math.sqrt(0.148148), 2 / 3 + 1.96 * math.sqrt(0.148148)), abs=1e-5)
+    with pytest.raises(ValueError, match="method"):
+        res.scores(method="exact")
 
 def test_judge_after_save(tok, tmp_path, monkeypatch):
     """A rollout is on disk before the judge sees it; a judge failure leaves it unjudged for the next pass."""
@@ -264,3 +269,58 @@ def test_deficit(tok, tmp_path, monkeypatch):
     assert res.deficit(0.05)[0] == 105 and 0 not in res.deficit(0.05, n_max=100)
     assert res.deficit(0.5, n_min=20)[20] == 9 and 0 not in res.deficit(0.5, n_min=20)  # the floor is asked for a batch at a time
     assert res.deficit(0.5, n_min=6) == {t: 5 for t in range(55) if t not in (0, 20, 51)} | {20: 6}
+
+def test_estimate():
+    """A hand-checked pool on a 3-token text: (t, k, outcome) rollouts sampled from t that continue with the text's next k tokens."""
+    rollouts = [(0, 3, True), (0, 0, False), (1, 1, True), (2, 0, None), (3, 0, False)]
+    counts = lambda est: [(s["t"], s["n"], s["direct"], s["k"], s["judged"], s["other"]) for s in est]
+    naive = estimate(3, rollouts, "naive")
+    assert counts(naive) == [(0, 2, 2, 1, 2, 0), (1, 1, 1, 1, 1, 0), (2, 1, 1, 0, 0, 1), (3, 1, 1, 0, 1, 0)] and [s["p"] for s in naive][:2] == [0.5, 1.0] and math.isnan(naive[2]["p"]) and naive[3]["p"] == 0.0 and naive[0]["ci"] == wilson(1, 2)
+    reuse = estimate(3, rollouts)
+    assert counts(reuse) == [(0, 2, 2, 1, 2, 0), (1, 2, 1, 2, 2, 0), (2, 3, 1, 2, 2, 1), (3, 2, 1, 1, 2, 0)] and [s["p"] for s in reuse] == [0.5, 1.0, 1.0, 0.5]
+    rc = estimate(3, rollouts, "recursion")
+    assert counts(rc) == counts(reuse)
+    # from the end: p(3) = 1/2 over the two that get there, variance (1/2)(1/2)/2. At 2 one of the two judged departs with True and one continues: p = 1/2 + p(3)/2; at 1 both continue: p = p(2); at 0 one of two departs with False: p = p(1)/2
+    assert [s["p"] for s in rc] == pytest.approx([0.375, 0.75, 0.75, 0.5])
+    v3 = 0.125
+    v2 = 0.5 * (2 / 3) * (1 / 3) / 2 + 0.25 * v3 + 0.5 * 0.5 * (0.5 - 1) ** 2 / 2
+    v0 = 0.5 * (1 / 3) * (2 / 3) / 2 + 0.25 * v2 + 0.5 * 0.5 * (0.75 - 0) ** 2 / 2
+    assert [(s["ci"][1] - s["ci"][0]) / 3.92 for s in rc] == pytest.approx([math.sqrt(v0), math.sqrt(v2), math.sqrt(v2), math.sqrt(v3)])
+    with pytest.raises(ValueError, match="method"):
+        estimate(3, rollouts, "exact")
+
+def test_estimate_without_reuse_is_naive():
+    """When no rollout continues with the text's next token, every position's rollouts depart there and the recursion is the plain rate, with its shrunk-variance interval."""
+    rollouts = [(0, 0, True), (0, 0, True), (2, 0, False), (2, 0, True), (3, 0, None)]
+    rc, naive = estimate(3, rollouts, "recursion"), estimate(3, rollouts, "naive")
+    assert [s["p"] for s in rc][:2] == [s["p"] for s in naive][:2] == [1.0, 0.5] and math.isnan(rc[2]["p"]) and math.isnan(naive[2]["p"])
+    assert rc[0]["ci"] == pytest.approx((1 - 1.96 * math.sqrt(0.75 * 0.25 / 2), 1 + 1.96 * math.sqrt(0.75 * 0.25 / 2)))
+
+def test_recursion_is_unbiased_with_a_calibrated_interval():
+    """Rollouts simulated from a known process (per position, the chance of continuing with the text's token and the rate of True on departing), three per position on a 30-token text, 300 trials: the recursion's error against the truth averages zero, its z (error over the interval's sd) has mean square about 1 and 95% within 1.96, and its squared error is below reuse's, which is below naive's."""
+    rng = np.random.default_rng(0)
+    T, S, trials = 30, 3, 300
+    q, r = rng.uniform(0.6, 1.0, T), rng.uniform(0, 1, T + 1)  # r[T]: the rate among rollouts that reproduce the whole text
+    p = np.empty(T + 1)
+    p[T] = r[T]
+    for s in range(T - 1, -1, -1):
+        p[s] = q[s] * p[s + 1] + (1 - q[s]) * r[s]
+    err, z = {m: [] for m in ("naive", "reuse", "recursion")}, []
+    for _ in range(trials):
+        rolls = []
+        for t0 in range(T + 1):
+            for _ in range(S):
+                s = t0
+                while s < T and rng.random() < q[s]:
+                    s += 1
+                rolls.append((t0, s - t0, bool(rng.random() < r[s])))
+        for m in err:
+            est = estimate(T, rolls, m)
+            err[m] += [e["p"] - p[e["t"]] for e in est]
+            if m == "recursion":
+                z += [(e["p"] - p[e["t"]]) / ((e["ci"][1] - e["ci"][0]) / 3.92) for e in est]
+    mse = {m: np.mean(np.square(err[m])) for m in err}
+    z = np.array(z)
+    assert mse["recursion"] < 0.8 * mse["reuse"] < 0.8 * mse["naive"], mse
+    assert abs(np.mean(err["recursion"])) < 0.003 and abs(z.mean()) < 0.05, (np.mean(err["recursion"]), z.mean())
+    assert 0.85 < np.mean(z ** 2) < 1.2 and 0.92 < np.mean(np.abs(z) < 1.96) < 0.98, (np.mean(z ** 2), np.mean(np.abs(z) < 1.96))
