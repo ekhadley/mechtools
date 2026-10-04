@@ -71,3 +71,4 @@ Rows 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, and 13 are in the package. Rows 11, 14, 
 ## Todo
 
 - The advanced readout functions (`show_logits`, `top_readout` and its callers `jlens_readout` and `tlens_readout`, and the cluster readouts) should return a packaged object holding both the rendered visualization and the underlying computed data, instead of only displaying. That object would carry `save_html` for sharing a readout outside the notebook, methods to turn the same data into plots of various forms, and plain attribute access to the scores/tokens that were computed.
+- Make a set of flashcards covering the functions an end user of the library has to know, and the pitfalls and traps they should know about.
