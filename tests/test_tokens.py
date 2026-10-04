@@ -62,16 +62,16 @@ def test_to_ids_rejects_batches_and_str_tokens():
 
 def test_toks_html():
     h = toks_html(["a<b", "\n", "c"], [1, 2, 3], pos=-1)
-    assert "a&lt;b" in h and "↵" in h and h.count("border-bottom:2px solid #e66") == 1 and "id 3 &middot; &#x27;c&#x27;" in h
+    assert "a&lt;b" in h and "↵" in h and h.count("outline:1px solid #fc6") == 1 and "id 3 &middot; &#x27;c&#x27;" in h
     h = toks_html(list("abcdefg"), lo=2, hi=5)
     assert h.count("<span") == 3 and "… " in h and " …" in h
     h = toks_html(list("abcdefg"), pos=[3, -1])
-    assert h.count("<span data-p=") == 2 and "<span data-p=0 data-h='pos 3" in h and "<span data-p=1 data-h='pos 6" in h and "border-bottom:2px solid #e66" not in h
+    assert h.count("<span data-p=") == 2 and "<span data-p=0 data-h='pos 3" in h and "<span data-p=1 data-h='pos 6" in h and "outline:1px solid #fc6" not in h
     assert "<span" not in toks_html([], pos=-1) and "<span" not in toks_html([], pos=[0])  # no tokens: no crash
 
 def test_toks_html_vals():
     h = toks_html(["a", "b", "c"], vals=t.tensor([[1.0, -0.5, 0.0]]), val_name="attr")
-    assert "rgba(230,80,80,1.000)" in h and "rgba(80,130,230,0.500)" in h and "rgba(230,80,80,0.000)" in h and "&middot; attr -0.5'" in h
+    assert "rgba(230,80,80,0.850)" in h and "rgba(80,130,230,0.425)" in h and "rgba(230,80,80,0.000)" in h and "&middot; attr -0.5'" in h
     assert toks_html(["a", "b"], vals=[0, 0]).count("rgba(230,80,80,0.000)") == 2  # all-zero values: no division by zero, fully transparent shade
     with pytest.raises(ValueError, match="2 values for 3 tokens"):
         toks_html(["a", "b", "c"], vals=[1, 2])

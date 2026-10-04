@@ -93,8 +93,8 @@ def per_pos(fn, pos: int | list[int]):
     return fn(pos) if isinstance(pos, int) else {p: fn(p) for p in pos}
 
 def token_strip(toks: list[str], ids: list[int] | None = None, pos: int | list[int] = -1, ctx: int = 32) -> str:
-    """The tokens up to `ctx` either side of the position(s), alternating backgrounds, hover showing index, id (if given) and repr.
-    An int underlines that token; a list of positions marks each one, clickable as the position tabs of the enclosing `tabbed` widget."""
+    """The tokens up to `ctx` either side of the position(s), hover showing index, id (if given) and repr.
+    An int outlines that token in amber; a list of positions outlines each one, clickable as the position tabs of the enclosing `tabbed` widget."""
     ps = [p % len(toks) for p in ([pos] if isinstance(pos, int) else pos)]
     return f"<div style='margin:0 0 8px;color:#ddd'>{toks_html(toks, ids, ps[0] if isinstance(pos, int) else ps, max(0, min(ps) - ctx), min(len(toks), max(ps) + ctx + 1))}</div>"
 
@@ -125,7 +125,7 @@ def tabbed(panes: dict[str, str] | dict[str, dict[str, str]], head: str = "", ba
 
 def top_readout(scores: dict[str, Tensor], names, k: int = 10, softmax: bool = True, title: str | None = None, input_src=None, pos: int = -1, ctx: int = 32, n_cols: int = 4, tokenizer=None):
     """One table per entry of `scores` ({header: [n] logits or scores}) listing its top-k items (k clipped to n). softmax=True shows probs, else raw scores.
-    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of pos, the one at pos underlined; a string is tokenized with special tokens added, so pass a self-rendered template string as ids."""
+    names maps an item id to its string: a list, or a callable like tokenizer.decode. input_src (see get_toks) shows the tokens up to ctx either side of pos, the one at pos outlined in amber; a string is tokenized with special tokens added, so pass a self-rendered template string as ids."""
     name = names.__getitem__ if isinstance(names, list) else names
     tables = []
     for header, s in scores.items():

@@ -43,7 +43,7 @@ show_logits(conv, model=model, k=10)        # click any token to see the top-k p
 Every function takes the same kinds of input: a string, a sequence of token ids, or a conversation (a list of role/content dicts, rendered through the tokenizer's chat template). Chat-template kwargs like `add_generation_prompt` or `enable_thinking` are forwarded.
 
 - `to_ids`, `to_str_toks`: ids or decoded strings of any input.
-- `show_toks`: HTML token strip. Hover shows position, token id and repr. `pos` underlines one token. `vals=` shades each token by a scalar (red positive, blue negative), for attributions or probe scores along a sequence.
+- `show_toks`: HTML token strip. Hover shows position, token id and repr. `pos` outlines one token in amber. `vals=` shades each token by a scalar (red positive, blue negative), for attributions or probe scores along a sequence.
 - `underline_stoks`: the same boundaries in the terminal, alternating underline.
 - `apply_chat_template`: a left-padded `(input_ids, attention_mask)` batch from a list of conversations or plain prompt strings.
 - `get_turn_tok_idx`: token span of one message's content inside the rendered conversation.

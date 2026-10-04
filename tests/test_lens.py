@@ -34,7 +34,7 @@ def test_token_strip_marks_positions():
     assert h.count("<span data-p=") == 2 and "<span data-p=0 data-h='pos 5" in h and "<span data-p=1 data-h='pos 12" in h
     assert "data-h='pos 2 " in h and "data-h='pos 15 " in h and "data-h='pos 1 " not in h and "data-h='pos 16 " not in h  # window is min(pos)-ctx to max(pos)+ctx
     h = token_strip(TOKS, pos=7, ctx=3)
-    assert "<span data-p" not in h and h.count("border-bottom:2px solid #e66") == 1
+    assert "<span data-p" not in h and h.count("outline:1px solid #fc6") == 1
 
 def test_tabbed_stacks_panes_and_wires_head():
     h = tabbed({"L0": {"p1": "a", "p2": "b"}, "L1": {"p1": "c", "p2": "d"}}, head=token_strip(TOKS, pos=[1, 2]))
@@ -111,7 +111,7 @@ def test_top_readout(shown):
     top_readout(scores, ["x", "y", "z<"], k=2, input_src=["u", "v"], pos=1)
     h = shown[-1]
     assert h.count("<table>") == 2 and "<th colspan=2>a&lt;</th>" in h and "&#x27;z&lt;&#x27;" in h
-    assert h.count("<tr") == 6 and fmt3(scores["a<"].softmax(-1)[1].item()) in h and h.count("border-bottom:2px solid #e66") == 1
+    assert h.count("<tr") == 6 and fmt3(scores["a<"].softmax(-1)[1].item()) in h and h.count("outline:1px solid #fc6") == 1
     top_readout(scores, lambda i: f"n{i}", k=1, softmax=False)
     assert "&#x27;n1&#x27;</td><td>3.00</td>" in shown[-1] and "&#x27;n2&#x27;</td><td>5.00</td>" in shown[-1]
 
@@ -163,7 +163,7 @@ def test_lens_readouts_with_fake_cache(shown):
     out = shown[-1]
     assert out.count("<table>") == 2 and "<th colspan=2>L0</th>" in out and "<th colspan=2>L2</th>" in out and out.count("<tr") == 6
     top = (3 * cache["blocks.2.hook_resid_pre"][0, -1] @ m.W_U).softmax(-1).topk(2)
-    assert f"<td>&#x27;&lt;{top.indices[0].item()}&gt;&#x27;</td><td>{fmt3(top.values[0].item())}</td>" in out and "border-bottom:2px solid #e66" in out
+    assert f"<td>&#x27;&lt;{top.indices[0].item()}&gt;&#x27;</td><td>{fmt3(top.values[0].item())}</td>" in out and "outline:1px solid #fc6" in out
     jlens_readout(cache, [1], 2, m, jl, hook="hook_resid_post", title="T")
     assert "T</h3>" in shown[-1] and fmt3((2 * cache["blocks.1.hook_resid_post"][0, 2] @ m.W_U).softmax(-1).max().item()) in shown[-1]
     tl = {"templates": t.randn(3, 5, d), "words": [f"tpl{i}" for i in range(5)]}
