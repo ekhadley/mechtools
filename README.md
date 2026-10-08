@@ -186,7 +186,7 @@ This only works when the provider feeds the model exactly the string you send, a
 
 ### `models`
 
-- `load_bridge(model_id)`: a `TransformerBridge` in eval mode with grads off. If `model_id` is a peft adapter repo, the base model is loaded and the adapter merged in memory.
+- `load_bridge(model_id)`: a `TransformerBridge` in eval mode with grads off. If `model_id` is a peft adapter repo, the base model is loaded and the adapter merged in memory. Extra keyword arguments (`quantization_config`, `max_memory`, `revision`, ...) go to `from_pretrained`, e.g. `load_bridge(model_id, quantization_config=FineGrainedFP8Config(dequantize=True), max_memory={0: "75GiB", 1: "75GiB"})`.
 - `load_hf_model(model_id)`: the same as a raw HF model.
 - `is_adapter_repo(model_id)`: whether a local directory or Hub repo holds an `adapter_config.json`.
 
