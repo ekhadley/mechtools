@@ -4,7 +4,6 @@ A read: ao_prompt renders one user turn, "Layer: {layer}\\n" + k placeholders (c
 
 The activations are the subject model's, captured with the adapter disabled at the output of decoder block L, "layer L" in the checkpoints' convention (`blocks.L.hook_resid_post` in the Bridge, HF hidden_states[L + 1]): hf = load_hf_model(base); model, config = load_ao(hf, repo); bridge = boot_bridge(hf); with model.disable_adapter(): _, cache = bridge.run_with_cache(ids). The read functions never change which adapters are active: they raise unless the oracle's adapter is exactly the active one, and the caller switches adapters with peft's own API."""
 
-import html
 import json
 import os
 
@@ -15,7 +14,7 @@ from IPython.display import HTML, display
 from peft import PeftModel
 
 from mechtools.hooks import decoder_layers, inject_generate
-from mechtools.lens import get_toks, readout_grid, readout_html, tabbed, token_strip
+from mechtools.lens import get_toks, readout_html, tabbed, token_strip
 from mechtools.models import adapter_spec, check_active, load_adapters
 from mechtools.stats import normed
 from mechtools.tokens import to_ids
@@ -82,7 +81,7 @@ def ao_readout(cache, layers, pos: int | list[int], model, tokenizer, config: di
             if not -acts.shape[0] <= p < acts.shape[0] or q - window + 1 < 0:
                 raise ValueError(f"a window of {window} at position {p} reaches outside the {acts.shape[0]}-token sequence")
             answers[layer][p] = {question: ao_read(model, tokenizer, acts[q - window + 1:q + 1], layer, question, config, 1, seed, **sampling)[0] for question in questions}
-            header = f"L{layer} &middot; p{q}" if window == 1 else f"L{layer} &middot; p{q - window + 1}..p{q}"
-            panes[f"L{layer}"][f"p{p}"] = readout_grid([(header, [([html.escape(question), f"<div style='white-space:normal;text-align:left;max-width:80ch'>{html.escape(answer)}</div>"], None) for question, answer in answers[layer][p].items()])])
+            header = [f"L{layer}", f"p{q}" if window == 1 else f"p{q - window + 1}..p{q}"]
+            panes[f"L{layer}"][f"p{p}"] = [(header, [[question, answer] for question, answer in answers[layer][p].items()], None, [None, "w"])]  # the answer in a wrapping column
     display(HTML(readout_html(tabbed(panes, token_strip(toks, ids, pos, ctx) if toks is not None else ""), title, n_cols=1)))
     return answers if isinstance(pos, list) else {layer: v[pos] for layer, v in answers.items()}

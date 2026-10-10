@@ -3,17 +3,18 @@ import torch as t
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from conftest import TINY_MODEL, load_tokenizer
+from conftest import TINY_MODEL, first_pane, load_tokenizer, widget_data
 from mechtools import olens
 from mechtools.hooks import decoder_layers
 from mechtools.models import boot_bridge, load_adapters
+from mechtools.lens import readout_grid
 from mechtools.olens import *
 from mechtools.stats import normed
 from mechtools.tokens import single_token_marker
 
 D = 16
 GREEDY = {"do_sample": False, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 3}
-td = lambda s: f"<td><div style='text-align:left;white-space:normal'>{s}</div></td>"  # a readout cell: the frame right-aligns a bare last cell and keeps it on one line
+td = lambda s: f"<td class=w><div>{s}</div></td>"  # a readout cell in the wrapping column: its text in a div the frame caps at 100ch
 
 @pytest.fixture(scope="module")
 def tok():
@@ -202,14 +203,16 @@ def test_olens_readout(lens, tok, fake_generate, shown, monkeypatch):
     assert len(vecs) == 2 and all(v.shape == (4, D) for v in vecs) and all(t.equal(v, cache[f"blocks.{l}.hook_resid_post"][0, [2, -1]].repeat_interleave(2, 0)) for l, v in enumerate(vecs))  # one batched read per layer, positions in order
     assert seen["ids"] == olens_prompt(tok, 1, c, chars="ZQXJ")[0] and seen["max_new_tokens"] == 3 and seen["seed"] == 7
     h = shown[-1]
-    assert h.count("class='pane'") == 4 and h.count("<table>") == 8 and "<button>L0</button><button>L1</button>" in h and "<button>p2</button><button>p-1</button>" in h and h.count("class='tb' hidden") == 0
+    d = widget_data(h)
+    assert d["tabs"] == ["L0", "L1"] and d["inner"] == ["p2", "p-1"] and "<button class=on>L0</button><button>L1</button>" in h and "<button class=on>p2</button><button>p-1</button>" in h and h.count("class='tb' hidden") == 0
     assert h.count("<span data-p=") == 2 and f"<span data-p=1 data-h='pos {len(toks) - 1}" in h and "data-h='pos 2 " in h  # the strip marks both positions
-    assert "<th colspan=1>sample 0</th>" in h and "<th colspan=1>sample 1</th>" in h and td("0a") in h and td("3b") in h and "noise" not in h and "oracle lens readout</h3>" in h and "--n:2;" in h
+    assert d["panes"][0][1] == [["sample 0", [["2a"], ["2b"]], None, ["w"]], ["sample 1", [["3a"], ["3b"]], None, ["w"]]] and d["panes"][0][0] is None and all(len(pane) == 2 for row in d["panes"] for pane in row if pane)  # a table per sample, a bullet per row, in every pane; the first pane rendered, not shipped
+    assert h.count("<table>") == 2 and "<th colspan=1>sample 0</th>" in h and "<th colspan=1>sample 1</th>" in h and td("0a") in h and td("1b") in h and "3b" not in first_pane(h) and "noise" not in h and "oracle lens readout</h3>" in h and "--n:2;" in h  # the first pane (L0, p2) rendered
     olens_readout(cache, [0], 2, peft, tok, c, chars="ZQXJ", do_sample=False, max_new_tokens=5)
     assert seen["kw"]["do_sample"] is False and seen["max_new_tokens"] == 5  # sampling kwargs override the contract's through olens_read
     out = olens_readout(cache, [1], 3, peft, tok, c, title="T", input_src=toks, chars="ZQXJ")
     h = shown[-1]
-    assert out == {1: [["0a", "0b"]]} and h.count("class='pane'") == 1 and h.count("class='tb' hidden") == 2 and "<span data-p=" not in h and h.count("outline:1px solid #fc6") == 1 and "T</h3>" in h and "--n:1;" in h and seen["seed"] == 0
+    assert out == {1: [["0a", "0b"]]} and "application/json" not in h and first_pane(h) == readout_grid([("sample 0", [["0a"], ["0b"]], None, ["w"])]) and h.count("class='tb' hidden") == 2 and "<span data-p=" not in h and h.count("outline:1px solid #fc6") == 1 and "T</h3>" in h and "--n:1;" in h and seen["seed"] == 0
     out = olens_readout(cache, [0], [1], peft, tok, c, raw=True, hook="hook_resid_pre", chars="ZQXJ")
     assert out == {0: {1: ["- 0a\n- 0b\nnoise"]}} and t.equal(vecs[-1], cache["blocks.0.hook_resid_pre"][0, [1]]) and td("- 0a") in shown[-1] and td("noise") in shown[-1] and shown[-1].count("<tr") == 4 and "class='tk'" not in shown[-1]  # raw: a line per row; no input_src, no strip
     n_calls = len(vecs)
@@ -220,7 +223,7 @@ def test_olens_readout(lens, tok, fake_generate, shown, monkeypatch):
     assert len(vecs) == n_calls and len(shown) == 4
     monkeypatch.setattr(olens, "inject_generate", lambda *a, **kw: ["- a<b & c"])
     olens_readout(cache, [0], 0, peft, tok, c, chars="ZQXJ")
-    assert td("a&lt;b &amp; c") in shown[-1]
+    assert td("a&lt;b &amp; c") in shown[-1] and "application/json" not in shown[-1]  # escaped in the rendered pane; one pane, so no payload
     with pytest.raises(KeyError, match="blocks.5.hook_resid_post"):
         olens_readout(cache, [5], 0, peft, tok, c, chars="ZQXJ")
     assert len(shown) == 5
@@ -238,7 +241,7 @@ def test_olens_readout_end_to_end(lens, tok, shown):
     assert not t.allclose(cache_on["blocks.1.hook_resid_post"], cache["blocks.1.hook_resid_post"])  # the lens's own activations differ from the base model's
     out = olens_readout(cache, [0, 1], [0, -1], peft, tok, c, n=2, input_src=ids, chars="ZQXJ")
     assert list(out) == [0, 1] and list(out[1]) == [0, -1] and all(len(out[l][p]) == 2 and all(isinstance(s, list) for s in out[l][p]) for l in out for p in out[l])
-    assert shown[-1].count("class='pane'") == 4 and shown[-1].count("<span data-p=") == 2 and peft.active_adapters == ["olens"]
+    assert [len(row) for row in widget_data(shown[-1])["panes"]] == [2, 2] and shown[-1].count("<span data-p=") == 2 and peft.active_adapters == ["olens"]
 
 @pytest.mark.hf
 @pytest.mark.parametrize("name, spec, layer, bad", [("Qwen/Qwen3-0.6B", "andyx10/oracle-lens-qwen3-4b", 12, 13), ("Qwen/Qwen3.6-27B", "agu18dec/olens_and_ar:olens_s3d_rl600", 44, 43)])

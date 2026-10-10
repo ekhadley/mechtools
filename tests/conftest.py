@@ -1,7 +1,18 @@
+import json
+import re
+
 import pytest
 import torch as t
 
 TINY_MODEL = "hf-internal-testing/tiny-random-LlamaForCausalLM"  # 1M parameters, 2 layers, d 16, Llama-2 tokenizer; boots a TransformerBridge in under a second
+
+def widget_data(h: str) -> dict:
+    """The JSON payload of a tabbed readout's html, {"tabs", "inner", "panes"} with the first pane's entry None, as its script parses it: what the readout tests check the data against. A widget of one pane has none."""
+    return json.loads(re.search(r"<script type=application/json id='\w+'>(.*?)</script>", h, re.S).group(1))
+
+def first_pane(h: str) -> str:
+    """The html of the one pane rendered into a tabbed readout's html, the pane shown where scripts do not run."""
+    return re.search(r"<div class='pane'>(.*?</div>)</div></div>(?:</div>|<script type=application/json)", h, re.S).group(1)
 
 def load_tokenizer(name: str):
     """AutoTokenizer.from_pretrained, skipping the test when the tokenizer is not in the offline HF cache."""

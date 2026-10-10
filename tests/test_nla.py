@@ -9,7 +9,7 @@ import yaml
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM
 
-from conftest import TINY_MODEL, load_tokenizer
+from conftest import TINY_MODEL, load_tokenizer, widget_data
 from mechtools import nla
 from mechtools.hooks import decoder_layers
 from mechtools.models import boot_bridge, check_active
@@ -261,20 +261,21 @@ def test_nla_readout(booted, shown, captured):
     assert t.equal(call.vecs, resid[0, [3, -1]].repeat_interleave(2, dim=0)) and call.kwargs["temperature"] == 0.5 and call.kwargs["top_k"] == 64
     assert out == {3: ["s0", "s1"], -1: ["s2", "s3"]}
     h = shown[-1]
-    assert h.count("class='pane'") == 2 and h.count("class='tb' hidden") == 1 and "<button>p3</button><button>p-1</button>" in h and "NLA readout</h3>" in h
-    assert "data-p=0 data-h='pos 3 " in h and f"data-p=1 data-h='pos {len(ids) - 1} " in h and h.count("data-p=") == 2  # the strip marks both positions
+    d = widget_data(h)
+    assert d["tabs"] == [""] and d["inner"] == ["p3", "p-1"] and h.count("class='tb' hidden") == 1 and "<button class=on>p3</button><button>p-1</button>" in h and "NLA readout</h3>" in h
+    assert "data-p=0 class=on data-h='pos 3 " in h and f"data-p=1 data-h='pos {len(ids) - 1} " in h and h.count("data-p=") == 2  # the strip marks both positions, the first selected
     assert "data-h='pos 1 " in h and "data-h='pos 0 " not in h  # ctx reaches the strip: the window starts ctx before the first position
     with pytest.raises(ValueError, match=r"repeats a position: \[3, 3\]"):
         nla_readout(cache, [3, 3], model, tok, meta, input_src=ids)
     assert len(captured) == 1 and len(shown) == 1  # before generating or showing anything
-    p3, pl = re.findall(r"<table>.*?</table>", h)
-    assert p3.count("<tr") == 3 and f"<th colspan=2>p3 &middot; {html.escape(repr(tok.decode(ids[3])))}</th>" in p3 and ">s0<" in p3 and ">s1<" in p3 and "#1</span>" in p3 and "#2</span>" in p3
-    assert "<th colspan=2>p-1 &middot;" in pl and ">s2<" in pl and ">s3<" in pl
+    none, (pl,) = d["panes"][0]  # one table per position: the position and its token in the header, a dim sample number and the text in a wrapping column per row; the first pane rendered, not shipped
+    assert none is None and pl == [["p-1", repr(tok.decode(ids[-1]))], [["#1", "s2"], ["#2", "s3"]], None, ["d", "w"]]
+    assert h.count("<table>") == 1 and h.count("<tr") == 3 and f"<th colspan=2>p3 &middot; {html.escape(repr(tok.decode(ids[3])), False)}</th>" in h and "<td class=d>#1</td><td class=w><div>s0</div></td>" in h and "s2" not in h.split("application/json")[0]  # the first pane rendered
     assert "--n:1;" in h
     out = nla_readout(cache, 5, model, tok, meta, input_src=ids, title="T", raw=True, hook="hook_resid_pre")
     assert out == {5: ["<explanation> s0 </explanation> junk"]} and t.equal(captured[-1].vecs, cache["blocks.1.hook_resid_pre"][0, [5]])
     h = shown[-1]
-    assert h.count("class='pane'") == 1 and h.count("class='tb' hidden") == 2 and "data-p=" not in h and h.count("outline:1px solid #fc6") == 1 and "T</h3>" in h and "&lt;explanation&gt; s0" in h
+    assert "application/json" not in h and "<th colspan=2>p5 &middot; " in h and h.count("class='tb' hidden") == 2 and "data-p=" not in h and h.count("outline:1px solid #fc6") == 1 and "T</h3>" in h and "&lt;explanation&gt; s0" in h
     out = nla_readout(cache, [2], model, tok, meta, title=None)
     assert out == {2: ["s0"]} and "<h3" not in shown[-1] and "class='tk'" not in shown[-1]  # no input_src, no strip
     with pytest.raises(KeyError):

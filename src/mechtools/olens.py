@@ -5,7 +5,6 @@ Loading order: hf = load_hf_model(base); peft, contract = load_olens(hf); bridge
 OLENS holds each checkpoint's contract, from its card: agu18dec/olens_and_ar (the same adapter as agu18dec/oracle-lens-ddp600, sampling as WorkspaceBench's producer) and andyx10/oracle-lens-qwen3-4b (its lens_config.json, whose top_k 0 is unrestricted; its card also stops a sample at the marker id, which inject_generate does not, so a sample that emits the marker runs on to EOS or max_new_tokens)."""
 
 import copy
-import html
 from collections.abc import Iterable
 
 import torch as t
@@ -14,7 +13,7 @@ from IPython.display import HTML, display
 from peft import PeftModel
 
 from mechtools.hooks import inject_generate
-from mechtools.lens import get_toks, readout_grid, readout_html, tabbed, token_strip
+from mechtools.lens import get_toks, readout_html, tabbed, token_strip
 from mechtools.models import check_active, load_adapters
 from mechtools.stats import normed
 from mechtools.tokens import single_token_marker, to_ids
@@ -76,6 +75,6 @@ def olens_readout(cache, layers, pos: int | list[int], model, tokenizer, contrac
     for layer in layers:
         samples = olens_read(model, tokenizer, cache[f"blocks.{layer}.{hook}"][0, positions], layer, contract, n, seed, raw, chars, **sampling)
         out[layer] = dict(zip(positions, samples))
-        panes[f"L{layer}"] = {f"p{p}": readout_grid([(f"sample {j}", [([f"<div style='text-align:left;white-space:normal'>{html.escape(line)}</div>"], None) for line in (s.splitlines() if raw else s)]) for j, s in enumerate(ss)]) for p, ss in out[layer].items()}  # a bare last cell is right-aligned and kept on one line by the frame's (name, value) css, which would push the sample tables past the frame
+        panes[f"L{layer}"] = {f"p{p}": [(f"sample {j}", [[line] for line in (s.splitlines() if raw else s)], None, ["w"]) for j, s in enumerate(ss)] for p, ss in out[layer].items()}  # one wrapping column ('w'): the bullets wrap inside the frame instead of pushing the sample tables past it
     display(HTML(readout_html(tabbed(panes, token_strip(toks, ids, pos, ctx) if toks is not None else ""), title, n_cols=min(n, 4))))
     return out if isinstance(pos, list) else {layer: v[pos] for layer, v in out.items()}

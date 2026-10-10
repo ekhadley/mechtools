@@ -1,4 +1,3 @@
-import html
 import os
 
 import torch as t
@@ -9,7 +8,7 @@ from IPython.display import HTML, display
 from peft import PeftModel
 
 from mechtools.hooks import decoder_layers, inject_generate
-from mechtools.lens import get_toks, readout_grid, readout_html, tabbed, token_strip
+from mechtools.lens import get_toks, readout_html, tabbed, token_strip
 from mechtools.models import check_active, load_adapters
 from mechtools.tokens import to_ids
 
@@ -76,7 +75,6 @@ def nla_readout(cache, pos: int | list[int], model, tokenizer, meta: dict, n: in
         raise ValueError(f"pos repeats a position: {positions}")
     texts = nla_read(model, tokenizer, cache[f"blocks.{meta['layer']}.{hook}"][0, positions], meta, n, seed, raw, **sampling)
     toks, ids = get_toks(input_src, tokenizer)
-    cell = lambda s: f"<div style='text-align:left;white-space:pre-wrap;max-width:100ch'>{html.escape(s)}</div>"
-    panes = {f"p{p}": readout_grid([(f"p{p}" + (f" &middot; {html.escape(repr(toks[p]))}" if toks else ""), [([f"<span style='color:#999'>#{j}</span>", cell(s)], None) for j, s in enumerate(samples, 1)])]) for p, samples in zip(positions, texts)}
+    panes = {f"p{p}": [([f"p{p}", repr(toks[p])] if toks else f"p{p}", [[f"#{j}", s] for j, s in enumerate(samples, 1)], None, ["d", "w"])] for p, samples in zip(positions, texts)}  # a dim sample number, then the text in a wrapping column
     display(HTML(readout_html(tabbed({"": panes}, token_strip(toks, ids, pos, ctx) if toks is not None else ""), title, n_cols=1)))
     return dict(zip(positions, texts))

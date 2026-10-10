@@ -131,6 +131,8 @@ jlens_cluster_readout(cache, layers=[8, 16, 24], pos=[-1, -5], model=model, jlen
 
 Readouts take `input_src` for the token strip: a string, ids, or a conversation. A string is tokenized with special tokens added, so for a self-rendered template string pass its ids.
 
+A tabbed readout renders its first pane and ships the others as one JSON payload from which the widget builds a pane's tables when it is shown, so a readout over many layers and positions is a few bytes per row and holds one pane's DOM, however many tabs it has. The widget holds the height of its tallest pane, so switching tabs does not make the page jump, and a viewer that does not run scripts (an untrusted notebook, a GitHub preview) shows the first pane.
+
 ### `olens`
 
 The oracle lens (Appendix A.9.2 of the workspace paper): a LoRA on the subject model that verbalizes one residual-stream activation as a list of bullet concepts. Checkpoints for Qwen3.6-27B (`agu18dec/olens_and_ar`, the default) and Qwen3-4B (`andyx10/oracle-lens-qwen3-4b`); each one's read contract (layers, alpha, marker, sampling) is in `OLENS`, and a read with another contract is a different experiment.

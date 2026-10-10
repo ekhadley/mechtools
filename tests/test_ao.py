@@ -5,9 +5,10 @@ import torch as t
 from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM
 
-from conftest import TINY_MODEL, load_tokenizer
+from conftest import TINY_MODEL, first_pane, load_tokenizer, widget_data
 from mechtools import ao
 from mechtools.ao import *
+from mechtools.lens import readout_grid
 from mechtools.hooks import decoder_layers, inject_generate
 from mechtools.models import boot_bridge, load_adapters
 from mechtools.tokens import to_ids
@@ -251,13 +252,15 @@ def test_ao_readout_plumbing(oracle, tok, captured, shown):
     assert t.equal(captured[0]["vecs"][0], cache["blocks.0.hook_resid_post"][0, 2:4]) and t.equal(captured[2]["vecs"][0], cache["blocks.0.hook_resid_post"][0, 7:9]) and t.equal(captured[5]["vecs"][0], cache["blocks.1.hook_resid_post"][0, 2:4])
     assert "Layer: 0\n" in tok.decode(captured[0]["ids"]) and "Layer: 1\n" in tok.decode(captured[4]["ids"])
     h = shown[-1]
-    assert h.count("class='pane'") == 4 and "<button>L0</button><button>L1</button>" in h and "<button>p3</button><button>p-1</button>" in h and h.count("class='tb' hidden") == 0
-    assert h.count("data-p=") == 2 and "data-p=0 data-h='pos 3 &middot; id 13" in h and "data-p=1 data-h='pos 8 &middot; id 18" in h
-    assert h.count("<tr") == 12 and h.count("Which &lt;language&gt;?") == 4 and "answer 8 row 0" in h and "<th colspan=2>L1 &middot; p7..p8</th>" in h and "activation oracle readout</h3>" in h
+    d = widget_data(h)
+    assert d["tabs"] == ["L0", "L1"] and d["inner"] == ["p3", "p-1"] and "<button class=on>L0</button><button>L1</button>" in h and "<button class=on>p3</button><button>p-1</button>" in h and h.count("class='tb' hidden") == 0
+    assert h.count("data-p=") == 2 and "data-p=0 class=on data-h='pos 3 &middot; id 13" in h and "data-p=1 data-h='pos 8 &middot; id 18" in h
+    assert d["panes"][0][0] is None and [tb[1][1][0] for row in d["panes"] for pane in row if pane for tb in pane] == ["Which <language>?"] * 3 and d["panes"][1][1] == [[["L1", "p7..p8"], [["What topic?", "answer 7 row 0"], ["Which <language>?", "answer 8 row 0"]], None, [None, "w"]]]  # a table per pane, a row per question
+    assert h.count("<tr") == 3 and "<th colspan=2>L0 &middot; p2..p3</th>" in h and "<td>Which &lt;language&gt;?</td><td class=w><div>answer 2 row 0</div></td>" in h and "activation oracle readout</h3>" in h  # the first pane rendered
     answers = ao_readout(cache, [0], 2, model, tok, config, ["q"], hook="hook_resid_pre", title="T")
     assert answers == {0: {"q": "answer 9 row 0"}} and t.equal(captured[-1]["vecs"][0], cache["blocks.0.hook_resid_pre"][0, 2:3])  # an int pos collapses the position level, like cluster_readout
     h = shown[-1]
-    assert h.count("class='pane'") == 1 and h.count("class='tb' hidden") == 2 and "data-p=" not in h and "<th colspan=2>L0 &middot; p2</th>" in h and "T</h3>" in h
+    assert "application/json" not in h and first_pane(h) == readout_grid([(["L0", "p2"], [["q", "answer 9 row 0"]], None, [None, "w"])]) and h.count("class='tb' hidden") == 2 and "data-p=" not in h and "<th colspan=2>L0 &middot; p2</th>" in h and "T</h3>" in h
     assert ao_readout(cache, [0, 1], -1, model, tok, config, ["q"], input_src=list(range(9))) == {0: {"q": "answer 10 row 0"}, 1: {"q": "answer 11 row 0"}} and t.equal(captured[-1]["vecs"][0], cache["blocks.1.hook_resid_post"][0, 8:9]) and "data-h='pos 8 &middot; id 8" in shown[-1] and "outline:1px solid #fc6" in shown[-1] and "data-p=" not in shown[-1]  # an int pos marks the token without making it a tab
     n_calls, n_shown = len(captured), len(shown)
     with pytest.raises(ValueError, match="a window of 2 at position 0 reaches outside the 9-token sequence"):
@@ -295,7 +298,9 @@ def test_ao_readout_from_bridge_cache(booted, shown):
     assert list(answers) == [0, 1] and list(answers[0]) == [-1, -3] and all(isinstance(a, str) for by_pos in answers.values() for by_q in by_pos.values() for a in by_q.values())
     assert answers[1][-1]["What topic?"] == ao_read(model, tok, cache["blocks.1.hook_resid_post"][0, -1], 1, "What topic?", config, max_new_tokens=3)[0]
     h = shown[-1]
-    assert h.count("class='pane'") == 4 and "<button>L0</button><button>L1</button>" in h and "<button>p-1</button><button>p-3</button>" in h and h.count("data-p=") == 2 and h.count("<tr") == 12
+    d = widget_data(h)
+    assert d["tabs"] == ["L0", "L1"] and d["inner"] == ["p-1", "p-3"] and "<button class=on>L0</button><button>L1</button>" in h and "<button class=on>p-1</button><button>p-3</button>" in h and h.count("data-p=") == 2
+    assert sum(len(tb[1]) for row in d["panes"] for pane in row if pane for tb in pane) == 6 and h.count("<tr") == 3  # two question rows in each of the three shipped panes; the first pane rendered
 
 @pytest.mark.hf
 @pytest.mark.parametrize("name, special_id", [("meta-llama/Llama-3.2-1B-Instruct", 949), ("Qwen/Qwen3-0.6B", 937), ("Qwen/Qwen3.6-27B", 907), ("google/gemma-3-1b-it", 2360)])
