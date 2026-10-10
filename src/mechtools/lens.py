@@ -67,7 +67,7 @@ def top_templates_table(scores: Tensor, words: list[str], k: int = 10, title: st
 
 # ============================= HTML readouts ============================= #
 
-READOUT_CSS = "<style>.ro{display:grid;grid-template-columns:repeat(var(--n),1fr);gap:8px} .ro table{border-collapse:collapse;align-self:start} .ro th{background:#2a3f5f;text-align:left;padding:3px 6px;font-weight:normal} .ro td{padding:1px 6px;white-space:nowrap;text-align:left;color:#eee} .ro td:last-child{text-align:right;color:#eee} .tb{margin:0 0 8px} .tb button{background:#222;color:#aaa;border:1px solid #444;padding:2px 8px;font:inherit;cursor:pointer} .tb button.on{background:#2a3f5f;color:#fff} .pn{display:grid} .pane{grid-area:1/1;visibility:hidden} .pane.on{visibility:visible}</style>"  # the grid's column count is the --n variable set on each widget's frame, so widgets with different n_cols coexist in one notebook
+READOUT_CSS = "<style>.ro{display:grid;grid-template-columns:repeat(var(--n),1fr);gap:8px} .ro table{border-collapse:collapse;align-self:start} .ro th{background:#2a3f5f;text-align:left;padding:3px 6px;font-weight:normal} .ro td{padding:1px 6px;white-space:nowrap;text-align:left} .ro td:last-child{text-align:right;color:#eee} .tb{margin:0 0 8px} .tb button{background:#222;color:#aaa;border:1px solid #444;padding:2px 8px;font:inherit;cursor:pointer} .tb button.on{background:#2a3f5f;color:#fff} .pn{display:grid} .pane{grid-area:1/1;visibility:hidden} .pane.on{visibility:visible}</style>"  # the grid's column count is the --n variable set on each widget's frame, so widgets with different n_cols coexist in one notebook
 
 def fmt3(x: float) -> str:
     """3 sig figs: fixed point down to 1e-4, scientific below that."""
