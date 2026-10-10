@@ -49,6 +49,7 @@ Every function takes the same kinds of input: a string, a sequence of token ids,
 - `get_turn_tok_idx`: token span of one message's content inside the rendered conversation.
 - `get_assistant_mask`: `(input_ids, attention_mask, assistant_mask)` where the mask is 1 on the tokens an SFT loss should predict, the content of every assistant turn plus its end-of-turn token.
 - `completion_loss`: mean cross-entropy over the masked tokens.
+- `single_token_marker`: a character that is exactly one token inside a rendered prompt, for the metamodels' injection slot.
 
 ```python
 convs = [[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}], ...]
@@ -92,6 +93,8 @@ Hook functions for `model.hooks(fwd_hooks=...)` and `model.run_with_hooks`.
 - `make_sae_feat_steer_hook`: `(hook_name, hook)` that adds a multiple of an SAE feature's decoder direction.
 - `scale_hooks` / `set_hooks`: per-layer hooks that rescale (0 ablates) or set the residual's projection onto a direction or a set of directions. The set is orthonormalized first, so repeated or correlated directions are not double counted.
 - `proj_out`: remove the component of a vector, or each row of a stack, along a direction.
+- `inject_generate`: generate from a prompt with vectors written into a module's output at given positions on the prefill, one batch row per vector, with a `write` function that decides how (replace, norm-matched add, ...). The generation path of the olens, nla and ao modules.
+- `decoder_layers`: the decoder blocks of an HF model, a PeftModel or a Bridge; block L's output is the Bridge's hook_resid_post at L.
 
 ```python
 hooks = scale_hooks({8: refusal_dir, 12: refusal_dir}, factor=0.0)
@@ -127,6 +130,61 @@ jlens_cluster_readout(cache, layers=[8, 16, 24], pos=[-1, -5], model=model, jlen
 - `get_lens_logits`, `get_tlens_scores`, `get_jlens_token_vec`, `get_template_vec`, `cluster_vocab`, `cluster_tlens`: the computations behind them.
 
 Readouts take `input_src` for the token strip: a string, ids, or a conversation. A string is tokenized with special tokens added, so for a self-rendered template string pass its ids.
+
+### `olens`
+
+The oracle lens (Appendix A.9.2 of the workspace paper): a LoRA on the subject model that verbalizes one residual-stream activation as a list of bullet concepts. Checkpoints for Qwen3.6-27B (`agu18dec/olens_and_ar`, the default) and Qwen3-4B (`andyx10/oracle-lens-qwen3-4b`); each one's read contract (layers, alpha, marker, sampling) is in `OLENS`, and a read with another contract is a different experiment.
+
+```python
+hf = load_hf_model("Qwen/Qwen3.6-27B")
+peft, contract = load_olens(hf)                       # the lens as a toggleable adapter; load_olens(hf, "andyx10/oracle-lens-qwen3-4b") for Qwen3-4B
+model = boot_bridge(hf)                               # adapters first, then the Bridge
+with peft.disable_adapter():                          # the subject model's activations, not the lens's
+    _, cache = model.run_with_cache(ids)
+
+olens_read(peft, tok, cache["blocks.44.hook_resid_post"][0, -1], 44, contract, n=2)   # two samples, each a list of concepts
+olens_readout(cache, layers=[28, 44, 60], pos=[-1, -3], model=peft, tokenizer=tok, contract=contract, input_src=ids)
+```
+
+- `load_olens`: `load_adapters` under a name plus the checkpoint's contract. Only the adapter files are fetched.
+- `olens_prompt`: the rendered prompt and the marker's slot, found by `single_token_marker` and checked against the contract.
+- `olens_read`: one batched generation for an activation or a stack of them, `n` samples each, parsed into bullets (`raw=True` for the texts).
+- `olens_readout`: a tab per layer and per position with the token strip, like the cluster readouts; returns the data.
+
+A checkpoint's "layer L" is the output of block L, which is the Bridge's hook_resid_post, so the readout's `hook` defaults to that where the lens module's readouts default to hook_resid_pre. Samples are deterministic given the batch of activations, `n` and `seed`, not per activation.
+
+### `nla`
+
+The natural language autoencoder (Anthropic 2026, trained with EasyNLA) for layer 42 of Qwen3.6-27B: a verbalizer that describes one activation in two or three snippets. The published checkpoint is a merged base plus an RL LoRA, and the merged-in warm-start LoRA is published too, so `load_nla` puts both on the plain base as a stack.
+
+```python
+peft, meta = load_nla(hf)                              # ceselder/qwen3.6-27b-nla-rl, RL step 400; meta is the checkpoint's nla_meta.yaml plus the adapter names and layer
+peft.base_model.set_adapter(meta["adapters"])          # both adapters active
+nla_read(peft, tok, cache[f"blocks.{meta['layer']}.hook_resid_post"][0, -1], meta, n=2)
+nla_readout(cache, pos=[-1, -3], model=peft, tokenizer=tok, meta=meta, input_src=ids)
+```
+
+- `load_nla_meta`, `load_nla`, `nla_prompt` (the marker is found by its trained id, neighbors checked), `parse_explanation`, `nla_write` (the norm-matched add at the output of block 1), `nla_read`, `nla_readout`.
+- The layer is fixed by the checkpoint. The prompt is rendered with thinking off, as the checkpoint card recommends; `enable_thinking=True` reproduces the training render.
+
+### `ao`
+
+Activation oracles (Karvonen et al. 2025): a LoRA on the subject model that answers a question about one or more of its activations, with checkpoints for 12 models across Gemma-2, Gemma-3, Qwen3 and Llama-3 in the `adamkarvonen/activation-oracles` collection.
+
+```python
+hf = load_hf_model("meta-llama/Llama-3.1-8B-Instruct")
+peft, config = load_ao(hf, "adamkarvonen/checkpoints_latentqa_cls_past_lens_Llama-3_1-8B-Instruct")
+model = boot_bridge(hf)
+with peft.disable_adapter():
+    _, cache = model.run_with_cache(ids)
+
+ao_read(peft, tok, cache["blocks.16.hook_resid_post"][0, -3:], 16, "What is the sentiment of this text?", config)   # three activations, one placeholder each
+ao_readout(cache, layers=[8, 16, 24], pos=-1, model=peft, tokenizer=tok, config=config, questions=["What is this text about?", "Is the speaker happy?"], window=3)
+```
+
+- `load_ao_config`, `load_ao`, `ao_prompt`, `ao_read` (greedy by default; the vectors are added norm-matched at the output of block 1, or written in place with `config["op"] = "replace"` for a checkpoint trained before the repo switched to adding), `ao_readout` (a row per question).
+
+The three modules share the same shape: adapters loaded with `load_adapters` and toggled with peft's own API, activations captured with the adapters disabled, one `inject_generate` call per read, and a read that raises unless exactly its adapters are active.
 
 ### `tables`
 
@@ -188,6 +246,9 @@ This only works when the provider feeds the model exactly the string you send, a
 
 - `load_bridge(model_id)`: a `TransformerBridge` in eval mode with grads off. If `model_id` is a peft adapter repo, the base model is loaded and the adapter merged in memory. Extra keyword arguments (`quantization_config`, `max_memory`, `revision`, ...) go to `from_pretrained`, e.g. `load_bridge(model_id, quantization_config=FineGrainedFP8Config(dequantize=True), max_memory={0: "75GiB", 1: "75GiB"})`.
 - `load_hf_model(model_id)`: the same as a raw HF model.
+- `boot_bridge(hf_model)`: the Bridge around an HF model already in memory. Load adapters before this, not after.
+- `load_adapters(hf_model, {name: spec})`: named peft adapters that stay toggleable instead of merged, for the metamodel modules; a spec is a Hub repo, `repo:subdir` or a local directory. Toggle with peft's own API (`set_adapter`, `base_model.set_adapter([...])` for a stack, `disable_adapter()` for the base model, `base_model.merge_adapter()` for faster generation). Raises when an adapter's tensors do not land on the model.
+- `check_active(model, names)`: raises unless exactly those adapters are active and enabled.
 - `is_adapter_repo(model_id)`: whether a local directory or Hub repo holds an `adapter_config.json`.
 
 ### `stats`

@@ -1,5 +1,6 @@
 import copy
 import html
+from collections.abc import Callable, Iterable
 
 import torch as t
 from torch import Tensor
@@ -112,3 +113,16 @@ def completion_loss(logits: Tensor, conv_toks: Tensor, comp_mask: Tensor, is_log
     logprobs = logits if is_logprobs else logits.log_softmax(dim=-1)
     tok_losses = -logprobs[:, :-1].gather(-1, conv_toks[:, 1:, None].to(logits.device)).squeeze(-1)
     return (tok_losses * comp_mask).sum() / comp_mask.count_nonzero()
+
+def single_token_marker(tokenizer, render: Callable[[str], list[int]], chars: Iterable[str] | None = None) -> tuple[str, int, list[int], int]:
+    """A character that is one token on its own and occurs as exactly one token in the rendered prompt: (char, its id, the rendered ids, the index of that token). `render(char)` returns the ids of the whole prompt with the character in place, chat template included, since BPE merges depend on the neighbors: a character that is one token alone can merge with a tag once inside the template (the oracle lens card's first candidate did).
+    `chars` defaults to the enclosed CJK letters U+3200 to U+33FF, the range the oracle lens and NLA checkpoints were trained with; on a Qwen3 tokenizer the scan lands on ㈎ (149705) and on Qwen3.6's on ㈜ (158983), the ids their cards name. Raises when no character survives."""
+    for char in map(chr, range(0x3200, 0x3400)) if chars is None else chars:
+        ids = tokenizer.encode(char, add_special_tokens=False)
+        if len(ids) != 1:
+            continue
+        rendered = render(char)
+        slots = [i for i, x in enumerate(rendered) if x == ids[0]]
+        if len(slots) == 1:
+            return char, ids[0], rendered, slots[0]
+    raise ValueError("no character in the range is a single token that occurs once in the rendered prompt")

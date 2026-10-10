@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -957,6 +957,7 @@ dependencies = [
     { name = "peft" },
     { name = "plotly" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "safetensors" },
     { name = "scipy" },
     { name = "tabulate" },
@@ -981,6 +982,7 @@ requires-dist = [
     { name = "peft", specifier = ">=0.20.0" },
     { name = "plotly", specifier = ">=5" },
     { name = "python-dotenv", specifier = ">=1" },
+    { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "safetensors", specifier = ">=0.5" },
     { name = "scipy", specifier = ">=1.18.1" },
     { name = "tabulate", specifier = ">=0.9" },

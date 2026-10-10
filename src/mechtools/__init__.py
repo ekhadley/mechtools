@@ -4,11 +4,14 @@ import IPython
 import numpy as np
 import torch as t
 
+from mechtools.ao import *
 from mechtools.bars import *
 from mechtools.colors import *
 from mechtools.hooks import *
 from mechtools.lens import *
 from mechtools.models import *
+from mechtools.nla import *
+from mechtools.olens import *
 from mechtools.openrouter import *
 from mechtools.plots import *
 from mechtools.resample import *

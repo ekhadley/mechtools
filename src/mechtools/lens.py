@@ -67,7 +67,7 @@ def top_templates_table(scores: Tensor, words: list[str], k: int = 10, title: st
 
 # ============================= HTML readouts ============================= #
 
-READOUT_CSS = "<style>.ro{{display:grid;grid-template-columns:repeat({n_cols},1fr);gap:8px}} .ro table{{border-collapse:collapse;align-self:start}} .ro th{{background:#2a3f5f;text-align:left;padding:3px 6px;font-weight:normal}} .ro td{{padding:1px 6px;white-space:nowrap;text-align:left}} .ro td:last-child{{text-align:right;color:#eee}} .tb{{margin:0 0 8px}} .tb button{{background:#222;color:#aaa;border:1px solid #444;padding:2px 8px;font:inherit;cursor:pointer}} .tb button.on{{background:#2a3f5f;color:#fff}} .pn{{display:grid}} .pane{{grid-area:1/1;visibility:hidden}} .pane.on{{visibility:visible}}</style>"
+READOUT_CSS = "<style>.ro{display:grid;grid-template-columns:repeat(var(--n),1fr);gap:8px} .ro table{border-collapse:collapse;align-self:start} .ro th{background:#2a3f5f;text-align:left;padding:3px 6px;font-weight:normal} .ro td{padding:1px 6px;white-space:nowrap;text-align:left;color:#eee} .ro td:last-child{text-align:right;color:#eee} .tb{margin:0 0 8px} .tb button{background:#222;color:#aaa;border:1px solid #444;padding:2px 8px;font:inherit;cursor:pointer} .tb button.on{background:#2a3f5f;color:#fff} .pn{display:grid} .pane{grid-area:1/1;visibility:hidden} .pane.on{visibility:visible}</style>"  # the grid's column count is the --n variable set on each widget's frame, so widgets with different n_cols coexist in one notebook
 
 def fmt3(x: float) -> str:
     """3 sig figs: fixed point down to 1e-4, scientific below that."""
@@ -103,9 +103,9 @@ def readout_grid(tables: list[tuple[str, list[tuple[list[str], str | None]]]]) -
     return "<div class='ro'>" + "".join(f"<table><tr><th colspan={len(rows[0][0]) if rows else 1}>{header}</th></tr>" + "".join(f"<tr{f' style=color:{color}' if color else ''}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>" for cells, color in rows) + "</table>" for header, rows in tables) + "</div>"
 
 def readout_html(body: str, title: str | None = None, toks: list[str] | None = None, ids: list[int] | None = None, pos: int = -1, ctx: int = 32, n_cols: int = 4) -> str:
-    """Dark monospace frame around `body` (a readout_grid, or tabbed grids) with an optional title and token strip above it."""
+    """Dark monospace frame around `body` (a readout_grid, or tabbed grids) with an optional title and token strip above it; its grids have `n_cols` columns."""
     heading = (f"<h3 style='margin:0 0 8px'>{title}</h3>" if title else "") + (token_strip(toks, ids, pos, ctx) if toks is not None else "")
-    return f"{READOUT_CSS.format(n_cols=n_cols)}<div style='background:#111;color:#eee;font:12px monospace;padding:8px'>{heading}{body}</div>"
+    return f"{READOUT_CSS}<div style='--n:{n_cols};background:#111;color:#eee;font:12px monospace;padding:8px'>{heading}{body}</div>"
 
 def tabbed(panes: dict[str, str] | dict[str, dict[str, str]], head: str = "", bars: bool = True) -> str:
     """A bar of tabs over the panes, one shown at a time, or two bars when the panes are nested dicts (every outer key having the same inner keys). A bar with a single tab is not shown, and bars=False hides both bars, leaving the tabs in `head` and the arrow keys as the only way to switch.
