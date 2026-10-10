@@ -1,6 +1,7 @@
 import html
 import json
 import math
+import operator
 import secrets
 
 import torch as t
@@ -114,20 +115,36 @@ def per_pos(fn, pos: int | list[int]):
 
 def token_strip(toks: list[str], ids: list[int] | None = None, pos: int | list[int] = -1, ctx: int = 32) -> str:
     """The tokens up to `ctx` either side of the position(s), hover showing index, id (if given) and repr.
-    An int outlines that token in amber; a list of positions outlines each one, clickable as the position tabs of the enclosing `tabbed` widget, the first one selected until a script says otherwise."""
+    An int outlines that token in amber; a list of positions outlines each one, clickable as the position tabs of the enclosing `tabbed` widget, the first one selected until a script says otherwise; a list that repeats a position once negative indices are wrapped raises, since two tabs cannot share one mark."""
     ps = [p % len(toks) for p in ([pos] if isinstance(pos, int) else pos)]
+    if len(set(ps)) != len(ps):
+        raise ValueError(f"positions repeat once wrapped: {ps}")
     return f"<div style='margin:0 0 8px;color:#ddd'>{toks_html(toks, ids, ps[0] if isinstance(pos, int) else ps, max(0, min(ps) - ctx), min(len(toks), max(ps) + ctx + 1))}</div>"
 
+def norm_color(c) -> int | str | None:
+    """A color as the renderers take it: None, a CSS color string, or a cluster id, any integer index (an int, a numpy integer, a 0-d integer tensor) as an int. Anything else raises."""
+    if c is None or isinstance(c, str):
+        return c
+    try:
+        return operator.index(c)
+    except TypeError:
+        raise TypeError(f"a color is a cluster id (an integer) or a CSS color string, or None; got {c!r}") from None
+
 def norm_table(table: tuple) -> tuple:
-    """(header, rows, color, cols) of a table given with color and cols optional (see readout_grid). Raises for a header that is not a str or a list of segments, a row that is not a list of str cells (the (cell htmls, color) tuples of the html form readout_grid took before 2026-10 among them), and a per-row color list with other than one entry per row."""
+    """(header, rows, color, cols) of a table given with color and cols optional (see readout_grid), colors through norm_color. Raises for a header that is not a str or a list of segments, a row that is not a list of str cells (the (cell htmls, color) tuples of the html form readout_grid took before 2026-10 among them), a color of another type, and a per-row color list with other than one entry per row."""
     header, rows, color, cols = (*table, None, None)[:4]
     if not isinstance(header, str) and not (isinstance(header, (list, tuple)) and all(isinstance(s, str) or (isinstance(s, (list, tuple)) and len(s) == 2 and isinstance(s[0], str)) for s in header)):
         raise TypeError(f"a table header is a str or a list of segments, each a str or (str, color); got {header!r}")
+    header = header if isinstance(header, str) else [s if isinstance(s, str) else (s[0], norm_color(s[1])) for s in header]
     for cells in rows:
         if not isinstance(cells, (list, tuple)) or not all(isinstance(c, str) for c in cells):
             raise TypeError(f"a table row is a list of str cells, which readout_grid escapes (cell html and (cells, color) tuples are not taken); got {cells!r}")
-    if isinstance(color, (list, tuple)) and len(color) != len(rows):
-        raise ValueError(f"{len(color)} row colors for {len(rows)} rows")
+    if isinstance(color, (list, tuple)):
+        if len(color) != len(rows):
+            raise ValueError(f"{len(color)} row colors for {len(rows)} rows")
+        color = [norm_color(c) for c in color]
+    else:
+        color = norm_color(color)
     return header, rows, color, cols
 
 def header_html(header: str | list) -> str:
@@ -170,6 +187,8 @@ def tabbed(panes: dict[str, list | str] | dict[str, dict[str, list | str]], head
     uid = "t" + secrets.token_hex(4)
     rows = {k: v if isinstance(v, dict) else {"": v} for k, v in panes.items()}
     inner = list(next(iter(rows.values())))
+    if not inner:
+        raise ValueError("no panes")
     if any(list(r) != inner for r in rows.values()):
         raise ValueError("every tab needs the same inner keys in the same order")
     data = {"tabs": [str(k) for k in rows], "inner": [str(k) for k in inner], "panes": [[p if isinstance(p, str) else [norm_table(tb) for tb in p] for p in r.values()] for r in rows.values()]}
@@ -198,7 +217,7 @@ NEXT_COLOR = "#e88"
 def show_logits(input_src, model=None, logits=None, tokenizer=None, k: int = 10, pos: list[int] | None = None, title: str | None = "logits", ctx: int = 32, n_cols: int = 4, add_special_tokens: bool = True):
     """Top-k next-token table for one position of the input at a time: click a token in the strip above (or use the up/down arrows) to see what the model predicts after it.
     Pass `model` to run it on the input, or `logits` [seq, vocab] (or [1, seq, vocab]) from your own forward pass. The row of the input's actual next token is colored, and appended below the top-k when it is not in it.
-    input_src (see get_toks) is a string (add_special_tokens=False for a self-rendered template string), ids, a conversation, or str tokens (which cannot be run through a model: pass logits with them); `pos` restricts the readout to those positions, all of them by default."""
+    input_src (see get_toks) is a string (add_special_tokens=False for a self-rendered template string), ids, a conversation, or str tokens (which cannot be run through a model: pass logits with them); `pos` restricts the readout to those positions, all of them by default, and raises when it names a position twice (-1 and the last index, say)."""
     assert (model is None) != (logits is None), "pass either model or logits"
     tokenizer = tokenizer if tokenizer is not None else model.tokenizer
     toks, ids = get_toks(input_src, tokenizer, add_special_tokens)
@@ -212,6 +231,8 @@ def show_logits(input_src, model=None, logits=None, tokenizer=None, k: int = 10,
     if logits.ndim != 2 or logits.shape[0] != len(toks):
         raise ValueError(f"logits should be [seq, vocab] for the {len(toks)} input tokens, got {tuple(logits.shape)}")
     positions = list(range(len(toks))) if pos is None else [p % len(toks) for p in pos]
+    if len(set(positions)) != len(positions):
+        raise ValueError(f"pos repeats a position once wrapped: {positions}")
     panes = {}
     for p in positions:
         probs = logits[p].float().softmax(-1)

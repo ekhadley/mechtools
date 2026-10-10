@@ -42,6 +42,8 @@ def test_token_strip_marks_positions():
     assert "data-h='pos 2 " in h and "data-h='pos 15 " in h and "data-h='pos 1 " not in h and "data-h='pos 16 " not in h  # window is min(pos)-ctx to max(pos)+ctx
     h = token_strip(TOKS, pos=7, ctx=3)
     assert "<span data-p" not in h and "class=on" not in h and h.count("outline:1px solid #fc6") == 1
+    with pytest.raises(ValueError, match=r"repeat once wrapped: \[19, 19\]"):
+        token_strip(TOKS, pos=[-1, 19])  # two tabs cannot share one mark
 
 def test_fmt3_and_helpers():
     assert [fmt3(x) for x in (0.5, 1.0, 12.345, 1e-5, 0.0001234, 0.0)] == ["0.500", "1.00", "12.3", "1.00e-05", "0.000123", "0.00"]
@@ -59,6 +61,15 @@ def test_fmt3_and_helpers():
         norm_table(("h", [["a", 1.0]]))
     with pytest.raises(TypeError, match="header is a str or a list of segments"):
         norm_table((3, []))
+    import numpy as np
+    assert norm_table(("h", [["x"], ["y"]], [np.int64(3), t.tensor(4)])) == ("h", [["x"], ["y"]], [3, 4], None) and norm_table(("h", [["x"]], t.tensor(2))) == ("h", [["x"]], 2, None)  # a numpy or tensor cluster id is an int
+    assert norm_table(([("c3", np.int32(3)), "n=2"], [], "#e88")) == ([("c3", 3), "n=2"], [], "#e88", None) and norm_table(("h", [["x"]], [None]))[2] == [None]
+    assert norm_color(None) is None and norm_color("#e88") == "#e88" and norm_color(t.tensor(5)) == 5 and type(norm_color(np.int64(5))) is int
+    for bad in (1.5, t.tensor(1.0), b"x"):
+        with pytest.raises(TypeError, match="a color is a cluster id"):
+            norm_table(("h", [["x"]], bad))
+    with pytest.raises(TypeError, match="a color is a cluster id"):
+        norm_table(("h", [["x"], ["y"]], [1, 2.0]))
     assert header_html("a<b") == "a&lt;b" and header_html([("c3", 3), "mass 0.5", "n=2<"]) == f'<span style="color:{cluster_color(3)}">c3</span> &middot; mass 0.5 &middot; n=2&lt;'
 
 def test_readout_grid_renders_tables():
@@ -128,6 +139,8 @@ def test_tabbed_validation_and_escaping():
     assert "class='tb' hidden" in tabbed({"only": "pane"}) and ">pane<" in tabbed({"only": "pane"})  # a single tab shows no bar; a raw html pane
     with pytest.raises(ValueError, match="no panes"):
         tabbed({})
+    with pytest.raises(ValueError, match="no panes"):
+        tabbed({"L0": {}})  # an empty inner dict is no pane either
     with pytest.raises(ValueError, match="same inner keys"):
         tabbed({"a": {"p1": "x"}, "b": {"p2": "y"}})
     with pytest.raises(ValueError, match="2 row colors for 1 rows"):
@@ -172,6 +185,8 @@ def test_show_logits_inputs(shown):
         show_logits([3, 1, 4], logits=t.randn(5, 8), tokenizer=tok)
     with pytest.raises(ValueError, match="needs input_src"):
         show_logits(None, logits=t.randn(3, 8), tokenizer=tok)
+    with pytest.raises(ValueError, match=r"repeats a position once wrapped: \[2, 2\]"):
+        show_logits([3, 1, 4], logits=t.randn(3, 8), tokenizer=tok, pos=[-1, 2])  # one mark per pane
     show_logits([3, 1, 4], logits=t.randn(1, 3, 8), tokenizer=tok, pos=[-1], k=2)
     assert "application/json" not in shown[-1] and first_pane(shown[-1]).count("<tr") == 3 and "data-p=0 class=on data-h='pos 2" in shown[-1] and "<h3" in shown[-1]  # one position: one rendered pane, no payload
     show_logits("one two", model=FakeModel(), k=2, title=None)  # a string is tokenized (with BOS) and run through the model
