@@ -77,8 +77,8 @@ def decoder_layers(model) -> list:
     return getattr(model, "original_model", model).get_decoder().layers
 
 @t.no_grad()
-def inject_generate(model, tokenizer, ids: list[int], module, positions: list[int], vecs: Tensor, write: Callable[[Tensor, Tensor], Tensor], max_new_tokens: int = 256, seed: int | None = 0, **generate_kwargs) -> list[str]:
-    """Generate from the prompt `ids` with vectors written into `module`'s output at `positions` on the prefill, one row of the batch per row of `vecs` ([n, len(positions), d], or [n, d] for a single position), and return each row's continuation decoded without special tokens, cut at the first id in eos_ids(model, tokenizer).
+def inject_generate(model, tokenizer, ids: list[int], module, positions: list[int], vecs: Tensor, write: Callable[[Tensor, Tensor], Tensor], max_new_tokens: int = 256, seed: int | None = 0, **generate_kwargs) -> list[dict]:
+    """Generate from the prompt `ids` with vectors written into `module`'s output at `positions` on the prefill, one row of the batch per row of `vecs` ([n, len(positions), d], or [n, d] for a single position). Returns a dict per row: `ids`, the sampled ids up to the first id in eos_ids(model, tokenizer), `text`, those ids decoded without special tokens, and `stopped`, whether the row ended at an eos id rather than at max_new_tokens.
     `write(orig, vecs)` gets the original rows and the vectors, both [n, k, d] float32 on the activation's device, and returns what replaces the rows, e.g. `lambda o, v: 16000 * normed(v)` or `lambda o, v: o + o.norm(dim=-1, keepdim=True) * normed(v)`. A forward with fewer positions than the prompt is a decode step, left alone, so sampled tokens are never written over; without a KV cache every step holds the whole sequence and is written at the same positions. The hook is removed when generation ends, also on an exception. `seed` seeds torch first, so the same vectors give the same samples (None leaves the RNG alone). `generate_kwargs` (do_sample, temperature, top_p, top_k, ...) go to generate, whose own defaults come from the model's generation config, so pass them all. `model` is any HF causal LM or PeftModel, with the adapter you want already active."""
     vecs = vecs[:, None] if vecs.ndim == 2 else vecs
     if vecs.ndim != 3 or vecs.shape[1] != len(positions):
@@ -101,4 +101,5 @@ def inject_generate(model, tokenizer, ids: list[int], module, positions: list[in
     finally:
         handle.remove()
     rows = out[:, len(ids):].tolist()
-    return [tokenizer.decode(row[:next((i for i, x in enumerate(row) if x in eos), len(row))], skip_special_tokens=True) for row in rows]
+    cut = [row[:next((i for i, x in enumerate(row) if x in eos), len(row))] for row in rows]
+    return [{"text": tokenizer.decode(c, skip_special_tokens=True), "ids": c, "stopped": len(c) < len(row)} for c, row in zip(cut, rows)]

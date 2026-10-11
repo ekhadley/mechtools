@@ -46,8 +46,8 @@ def ao_prompt(tokenizer, config: dict, layer: int, k: int, question: str) -> tup
         raise ValueError(f"need {k} consecutive placeholder tokens (id {special[0]}, {config['special_token']!r}) in the rendered prompt, found {len(positions)} at {positions}; a question holding the placeholder string adds to the count")
     return ids, positions
 
-def ao_read(model, tokenizer, hs: Tensor, layer: int, question: str, config: dict, n: int = 1, seed: int | None = 0, do_sample: bool = False, max_new_tokens: int = 50, **sampling) -> list[str]:
-    """`n` answers of the oracle to `question` about the activations `hs`, [k, d] (k vectors, one per placeholder, in order) or [d], read from layer `layer` of the subject model. config["adapter"] must be exactly the active adapter of `model` (check_active raises otherwise, also inside a disable_adapter() block; the caller sets adapters). The vectors are written into the output of decoder block config["hook_onto_layer"] at the placeholder positions by config["op"]: "add" gives h + ||h|| * v / ||v|| * coeff and "replace" gives ||h|| * v / ||v|| * coeff, with coeff = config["steering_coefficient"]. Greedy with 50 new tokens by default, like the paper's demo; any other sampling kwarg (temperature, top_p, top_k) reaches generate only when passed, and with do_sample=True each one not passed comes from the model's generation config (Llama-3.2-1B-Instruct's 0.6 and 0.9, Qwen3's 0.6, 0.95 and top_k 20, HF's own top_k 50), so pass all three. `seed` seeds torch first. The n rows run as one batch, all from the same prompt."""
+def ao_read(model, tokenizer, hs: Tensor, layer: int, question: str, config: dict, n: int = 1, seed: int | None = 0, do_sample: bool = False, max_new_tokens: int = 50, **sampling) -> list[dict]:
+    """`n` answers of the oracle to `question` about the activations `hs`, [k, d] (k vectors, one per placeholder, in order) or [d], read from layer `layer` of the subject model, as one record per answer: `layer`, `question`, `j` (the sample), `h` (the activations, [k, d] float32 on the cpu), `text` (the answer), `ids` (its sampled ids up to eos) and `stopped` (it ended at eos rather than at max_new_tokens). config["adapter"] must be exactly the active adapter of `model` (check_active raises otherwise, also inside a disable_adapter() block; the caller sets adapters). The vectors are written into the output of decoder block config["hook_onto_layer"] at the placeholder positions by config["op"]: "add" gives h + ||h|| * v / ||v|| * coeff and "replace" gives ||h|| * v / ||v|| * coeff, with coeff = config["steering_coefficient"]. Greedy with 50 new tokens by default, like the paper's demo; any other sampling kwarg (temperature, top_p, top_k) reaches generate only when passed, and with do_sample=True each one not passed comes from the model's generation config (Llama-3.2-1B-Instruct's 0.6 and 0.9, Qwen3's 0.6, 0.95 and top_k 20, HF's own top_k 50), so pass all three. `seed` seeds torch first. The n rows run as one batch, all from the same prompt."""
     check_active(model, [config["adapter"]])
     if config["op"] not in OPS:
         raise ValueError(f"config['op'] is {config['op']!r}, not 'add' or 'replace'")
@@ -56,18 +56,20 @@ def ao_read(model, tokenizer, hs: Tensor, layer: int, question: str, config: dic
     hs = t.atleast_2d(hs)
     ids, positions = ao_prompt(tokenizer, config, layer, hs.shape[0], question)
     write = lambda orig, vecs: OPS[config["op"]](orig, normed(vecs) * config["steering_coefficient"])
-    return inject_generate(model, tokenizer, ids, decoder_layers(model)[config["hook_onto_layer"]], positions, hs[None].repeat(n, 1, 1), write, max_new_tokens, seed, do_sample=do_sample, **sampling)
+    rows = inject_generate(model, tokenizer, ids, decoder_layers(model)[config["hook_onto_layer"]], positions, hs[None].repeat(n, 1, 1), write, max_new_tokens, seed, do_sample=do_sample, **sampling)
+    hc = hs.float().cpu()
+    return [{"layer": layer, "question": question, "j": j, "h": hc, **r} for j, r in enumerate(rows)]
 
-def ao_readout(cache, layers, pos: int | list[int], model, tokenizer, config: dict, questions: list[str], window: int = 1, seed: int | None = 0, hook: str = "hook_resid_post", input_src=None, title: str = "activation oracle readout", ctx: int = 32, **sampling) -> dict:
+def ao_readout(cache, layers, pos: int | list[int], model, tokenizer, config: dict, questions: list[str], window: int = 1, seed: int | None = 0, hook: str = "hook_resid_post", input_src=None, title: str = "activation oracle readout", ctx: int = 32, **sampling) -> list[dict]:
     """The oracle's answer to each of `questions` at every layer in `layers` and position in `pos` (an int or a list), from a run_with_cache cache of a single prompt captured with the adapter disabled (`with model.disable_adapter(): _, cache = bridge.run_with_cache(ids)`; with it active the cache holds the oracle's activations, not the subject's). `model` is the PeftModel with the oracle adapter active. The `window` activations at positions p - window + 1 .. p go to the oracle together, one placeholder each.
     The default hook is hook_resid_post, the output of block L, which is what the checkpoints' "Layer: L" means; hook_resid_pre at L is block L - 1's output, and the prompt would name the wrong layer. One greedy generation per (layer, position, question), since every question is its own prompt; `seed` and `sampling` go to ao_read.
-    Displays a tab per layer and, when pos is a list, a second bar per position, each pane a table with a row per question; the token strip of `input_src` (see get_toks) marks the positions, and clicking a marked token switches to it, so input_src must hold as many tokens as the cache. Returns {layer: {pos: {question: answer}}} for a list of positions, keyed as given, and {layer: {question: answer}} for an int, like cluster_readout."""
+    Displays a tab per layer and, when pos is a list, a second bar per position, each pane a table with a row per question; the token strip of `input_src` (see get_toks) marks the positions, and clicking a marked token switches to it, so input_src must hold as many tokens as the cache. Returns ao_read's records with `pos` (as given) added, layer-major, then position, then question."""
     if isinstance(questions, str):
         raise TypeError(f"questions is a list of strings, got the one string {questions!r}")
     if window < 1:
         raise ValueError(f"window must be at least 1, got {window}")
     toks, ids = get_toks(input_src, tokenizer)
-    answers, panes = {}, {}
+    recs, panes = [], {}
     for layer in layers:
         key = f"blocks.{layer}.{hook}"
         if cache[key].shape[0] != 1:
@@ -75,13 +77,14 @@ def ao_readout(cache, layers, pos: int | list[int], model, tokenizer, config: di
         acts = cache[key][0]
         if toks is not None and len(toks) != acts.shape[0]:
             raise ValueError(f"input_src has {len(toks)} tokens but the cache holds {acts.shape[0]} positions")
-        answers[layer], panes[f"L{layer}"] = {}, {}
+        panes[f"L{layer}"] = {}
         for p in [pos] if isinstance(pos, int) else pos:
             q = p % acts.shape[0]
             if not -acts.shape[0] <= p < acts.shape[0] or q - window + 1 < 0:
                 raise ValueError(f"a window of {window} at position {p} reaches outside the {acts.shape[0]}-token sequence")
-            answers[layer][p] = {question: ao_read(model, tokenizer, acts[q - window + 1:q + 1], layer, question, config, 1, seed, **sampling)[0] for question in questions}
+            rs = [{"layer": layer, "pos": p, **r} for question in questions for r in ao_read(model, tokenizer, acts[q - window + 1:q + 1], layer, question, config, 1, seed, **sampling)]
+            recs += rs
             header = [f"L{layer}", f"p{q}" if window == 1 else f"p{q - window + 1}..p{q}"]
-            panes[f"L{layer}"][f"p{p}"] = [(header, [[question, answer] for question, answer in answers[layer][p].items()], None, [None, "w"])]  # the answer in a wrapping column
+            panes[f"L{layer}"][f"p{p}"] = [(header, [[r["question"], r["text"]] for r in rs], None, [None, "w"])]  # the answer in a wrapping column
     display(HTML(readout_html(tabbed(panes, token_strip(toks, ids, pos, ctx) if toks is not None else ""), title, n_cols=1)))
-    return answers if isinstance(pos, list) else {layer: v[pos] for layer, v in answers.items()}
+    return recs

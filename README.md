@@ -93,7 +93,7 @@ Hook functions for `model.hooks(fwd_hooks=...)` and `model.run_with_hooks`.
 - `make_sae_feat_steer_hook`: `(hook_name, hook)` that adds a multiple of an SAE feature's decoder direction.
 - `scale_hooks` / `set_hooks`: per-layer hooks that rescale (0 ablates) or set the residual's projection onto a direction or a set of directions. The set is orthonormalized first, so repeated or correlated directions are not double counted.
 - `proj_out`: remove the component of a vector, or each row of a stack, along a direction.
-- `inject_generate`: generate from a prompt with vectors written into a module's output at given positions on the prefill, one batch row per vector, with a `write` function that decides how (replace, norm-matched add, ...). The generation path of the olens, nla and ao modules.
+- `inject_generate`: generate from a prompt with vectors written into a module's output at given positions on the prefill, one batch row per vector, with a `write` function that decides how (replace, norm-matched add, ...). Returns a dict per row: `text`, `ids` (up to eos) and `stopped` (ended at eos rather than at `max_new_tokens`). The generation path of the olens, nla and ao modules.
 - `decoder_layers`: the decoder blocks of an HF model, a PeftModel or a Bridge; block L's output is the Bridge's hook_resid_post at L.
 
 ```python
@@ -116,20 +116,20 @@ _, cache = model.run_with_cache(ids)
 jlens = load_jlens("qwen3.6-27b/j-lens/lens.pt", device=model.device)
 tlens = load_tlens("qwen3.6-27b/template-lens/templates+phrases_v3.safetensors")
 
-jlens_readout(cache, layers=[8, 16, 24], pos=-1, model=model, jlens=jlens, input_src=ids)    # top tokens per layer
-tlens_readout(cache, layers=[8, 16, 24], pos=-1, tlens=tlens, input_src=ids, tokenizer=tok)  # top templates per layer
+logits = jlens_readout(cache, layers=[8, 16, 24], pos=-1, model=model, jlens=jlens, input_src=ids)    # top tokens per layer; {layer: logits}
+cos = tlens_readout(cache, layers=[8, 16, 24], pos=-1, tlens=tlens, input_src=ids, tokenizer=tok)    # top templates per layer; {layer: cosines}
 
 labels, _ = cluster_vocab(model, k=1024)
-jlens_cluster_readout(cache, layers=[8, 16, 24], pos=[-1, -5], model=model, jlens=jlens, labels=labels, input_src=ids)
+logits, shown = jlens_cluster_readout(cache, layers=[8, 16, 24], pos=[-1, -5], model=model, jlens=jlens, labels=labels, input_src=ids)
 ```
 
-- `show_logits`: top-k next-token table for every position of an input, one at a time. Click a token in the strip, or use the arrow keys, to switch position. The row of the actual next token is highlighted. Pass `model` to run it, or `logits` from your own forward pass.
-- `jlens_readout`, `tlens_readout`: one top-k table per layer at a position.
-- `jlens_cluster_readout`, `tlens_cluster_readout`: the same with the vocabulary or the templates clustered by k-means, so a diffuse readout shows as a few named clusters instead of a long tail. A tab per layer and, when `pos` is a list, a second tab bar per position.
+- `show_logits`: top-k next-token table for every position of an input, one at a time. Click a token in the strip, or use the arrow keys, to switch position. The row of the actual next token is highlighted. Pass `model` to run it, or `logits` from your own forward pass. Returns the logits.
+- `jlens_readout`, `tlens_readout`: one top-k table per layer at a position. Return the full scores, `{layer: [vocab] or [n_templates]}`.
+- `jlens_cluster_readout`, `tlens_cluster_readout`: the same with the vocabulary or the templates clustered by k-means, so a diffuse readout shows as a few named clusters instead of a long tail. A tab per layer and, when `pos` is a list, a second tab bar per position. Return `(scores, shown cluster ids)`, both keyed by layer, then by position for a list.
 - `top_readout`, `cluster_readout`: the underlying widgets, for scores you computed yourself (`{header: [n] scores}` plus a names list or a decode function).
 - `get_lens_logits`, `get_tlens_scores`, `get_jlens_token_vec`, `get_template_vec`, `cluster_vocab`, `cluster_tlens`: the computations behind them.
 
-Readouts take `input_src` for the token strip: a string, ids, or a conversation. A string is tokenized with special tokens added, so for a self-rendered template string pass its ids.
+Readouts take `input_src` for the token strip: a string, ids, or a conversation. A string is tokenized with special tokens added, so for a self-rendered template string pass its ids. Every readout displays and returns its data; end the notebook line with `;` to keep the return value from printing.
 
 A tabbed readout renders its first pane and ships the others as one JSON payload from which the widget builds a pane's tables when it is shown, so a readout over many layers and positions is a few bytes per row and holds one pane's DOM, however many tabs it has. The widget holds the height of its tallest pane, so switching tabs does not make the page jump, and a viewer that does not run scripts (an untrusted notebook, a GitHub preview) shows the first pane.
 
@@ -144,29 +144,35 @@ model = boot_bridge(hf)                               # adapters first, then the
 with peft.disable_adapter():                          # the subject model's activations, not the lens's
     _, cache = model.run_with_cache(ids)
 
-olens_read(peft, tok, cache["blocks.44.hook_resid_post"][0, -1], 44, contract, n=2)   # two samples, each a list of concepts
-olens_readout(cache, layers=[28, 44, 60], pos=[-1, -3], model=peft, tokenizer=tok, contract=contract, input_src=ids)
+recs = olens_read(peft, tok, cache["blocks.44.hook_resid_post"][0, -1], 44, contract, n=2)   # two records, each with its list of concepts in "bullets"
+recs = olens_readout(cache, layers=[28, 44, 60], pos=[-1, -3], model=peft, tokenizer=tok, contract=contract, input_src=ids)   # one record per (layer, position, sample)
 ```
 
 - `load_olens`: `load_adapters` under a name plus the checkpoint's contract. Only the adapter files are fetched.
 - `olens_prompt`: the rendered prompt and the marker's slot, found by `single_token_marker` and checked against the contract.
-- `olens_read`: one batched generation for an activation or a stack of them, `n` samples each, parsed into bullets (`raw=True` for the texts).
-- `olens_readout`: a tab per layer and per position with the token strip, like the cluster readouts; returns the data.
+- `olens_read`: one batched generation for an activation or a stack of them, `n` samples each. Returns a record per sample: `layer`, `i` (the activation), `j` (the sample), `h` (the activation, float32 on the cpu), `text`, `ids`, `stopped` and `bullets`.
+- `olens_readout`: a tab per layer and per position with the token strip, like the cluster readouts (`raw=True` shows the texts instead of the bullets); returns the records with `pos` added.
 
 A checkpoint's "layer L" is the output of block L, which is the Bridge's hook_resid_post, so the readout's `hook` defaults to that where the lens module's readouts default to hook_resid_pre. Samples are deterministic given the batch of activations, `n` and `seed`, not per activation.
 
 ### `nla`
 
-The natural language autoencoder (Anthropic 2026, trained with EasyNLA) for layer 42 of Qwen3.6-27B: a verbalizer that describes one activation in two or three snippets. The published checkpoint is a merged base plus an RL LoRA, and the merged-in warm-start LoRA is published too, so `load_nla` puts both on the plain base as a stack.
+The natural language autoencoder (Anthropic 2026, trained with EasyNLA) for layer 42 of Qwen3.6-27B: a verbalizer that describes one activation in two or three snippets. The published checkpoint is a merged base plus an RL LoRA, and the merged-in warm-start LoRA is published too, so `load_nla` puts both on the plain base as a stack. The repo also holds the activation reconstructor, which maps an explanation back to an activation, so a read can be scored.
 
 ```python
-peft, meta = load_nla(hf)                              # ceselder/qwen3.6-27b-nla-rl, RL step 400; meta is the checkpoint's nla_meta.yaml plus the adapter names and layer
+peft, meta = load_nla(hf)                              # ceselder/qwen3.6-27b-nla-rl, RL step 600; meta is the checkpoint's nla_meta.yaml plus the adapter names and layer
 peft.base_model.set_adapter(meta["adapters"])          # both adapters active
-nla_read(peft, tok, cache[f"blocks.{meta['layer']}.hook_resid_post"][0, -1], meta, n=2)
-nla_readout(cache, pos=[-1, -3], model=peft, tokenizer=tok, meta=meta, input_src=ids)
+recs = nla_read(peft, tok, cache[f"blocks.{meta['layer']}.hook_resid_post"][0, -1], meta, n=2)
+recs = nla_readout(cache, pos=[-1, -3], model=peft, tokenizer=tok, meta=meta, input_src=ids)
+
+ar = load_nla_ar(dtype=t.bfloat16, device_map="cuda")  # 35 GB; free the verbalizer first on one 80 GB card
+recs = nla_score(recs, ar, tok, meta)                 # adds recon, cos and mse to each record
+nla_fve([r["mse"] for r in recs], acts)                # FVE against the predict-the-mean baseline of a reference set of activations
 ```
 
-- `load_nla_meta`, `load_nla`, `nla_prompt` (the marker is found by its trained id, neighbors checked), `parse_explanation`, `nla_write` (the norm-matched add at the output of block 1), `nla_read`, `nla_readout`.
+- `load_nla_meta`, `load_nla`, `nla_prompt` (the marker is found by its trained id, neighbors checked), `parse_explanation`, `nla_write` (the norm-matched add at the output of block 1).
+- `nla_read`: a record per sample: `i` (the activation), `j` (the sample), `h` (the activation, float32 on the cpu), `text`, `ids`, `stopped` and `explanation`. With `ar=`, scored by `nla_score`. `nla_readout` shows them per position (with `ar=`, each sample's cosine) and returns them with `pos` added.
+- `load_nla_ar`, `nla_reconstruct` (explanations to predicted activations), `nla_score` (`recon`, `cos` against `h`, and `mse` = 2(1 - cos), the training loss), `nla_fve`. One reconstructor was saved, at RL step 600, which is why `load_nla` defaults to that step.
 - The layer is fixed by the checkpoint. The prompt is rendered with thinking off, as the checkpoint card recommends; `enable_thinking=True` reproduces the training render.
 
 ### `ao`
@@ -184,9 +190,9 @@ ao_read(peft, tok, cache["blocks.16.hook_resid_post"][0, -3:], 16, "What is the 
 ao_readout(cache, layers=[8, 16, 24], pos=-1, model=peft, tokenizer=tok, config=config, questions=["What is this text about?", "Is the speaker happy?"], window=3)
 ```
 
-- `load_ao_config`, `load_ao`, `ao_prompt`, `ao_read` (greedy by default; the vectors are added norm-matched at the output of block 1, or written in place with `config["op"] = "replace"` for a checkpoint trained before the repo switched to adding), `ao_readout` (a row per question).
+- `load_ao_config`, `load_ao`, `ao_prompt`, `ao_read` (greedy by default; the vectors are added norm-matched at the output of block 1, or written in place with `config["op"] = "replace"` for a checkpoint trained before the repo switched to adding; a record per answer: `layer`, `question`, `j`, `h` (the [k, d] activations), `text`, `ids`, `stopped`), `ao_readout` (a row per question; returns the records with `pos` added).
 
-The three modules share the same shape: adapters loaded with `load_adapters` and toggled with peft's own API, activations captured with the adapters disabled, one `inject_generate` call per read, and a read that raises unless exactly its adapters are active.
+The three modules share the same shape: adapters loaded with `load_adapters` and toggled with peft's own API, activations captured with the adapters disabled, one `inject_generate` call per read, a read that raises unless exactly its adapters are active, and reads and readouts that return a flat list of records, one dict per sample, which `pd.DataFrame` takes as is.
 
 ### `tables`
 

@@ -47,8 +47,8 @@ def parse_bullets(text: str) -> list[str]:
     """The "- " bullet lines of a lens sample as concepts, without the marker and surrounding whitespace; other lines are dropped."""
     return [line[2:].strip() for line in map(str.strip, text.splitlines()) if line.startswith("- ")]
 
-def olens_read(model, tokenizer, h: Tensor, layer: int, contract: dict, n: int = 1, seed: int | None = 0, raw: bool = False, chars: Iterable[str] | None = None, **sampling) -> list:
-    """Verbalize activations from `layer` through the lens. `h` is one activation [d], giving a list of n items, or a stack [m, d], giving m lists of n items; an item is parse_bullets of a sample, or the sample's text with raw=True. `model` is the PeftModel with the lens active (check_active raises otherwise) and `tokenizer` the base model's.
+def olens_read(model, tokenizer, h: Tensor, layer: int, contract: dict, n: int = 1, seed: int | None = 0, chars: Iterable[str] | None = None, **sampling) -> list[dict]:
+    """Verbalize activations from `layer` through the lens: `h` is one activation [d] or a stack [m, d], read `n` times each, and the result is one record per sample, activation-major: `layer`, `i` (the row of h, 0 for a [d] vector), `j` (the sample), `h` (the activation, float32 on the cpu), `text` (the raw sample), `ids` (its sampled ids up to eos), `stopped` (it ended at eos rather than at max_new_tokens) and `bullets` (parse_bullets of the text). `model` is the PeftModel with the lens active (check_active raises otherwise) and `tokenizer` the base model's.
     One inject_generate call replaces the marker's input-embedding row with alpha * h / ||h|| in a batch of m * n rows ordered activation-major, sample-minor (row i * n + j is activation i's sample j), seeded by `seed` once for the batch, so the same call reproduces its samples while an activation read alone or in another stack samples differently. Sampling is contract["sampling"] updated by the kwargs (do_sample, temperature, top_p, top_k, max_new_tokens, ...). `chars` goes to olens_prompt's marker scan."""
     check_active(model, [contract["adapter"]])
     h = t.as_tensor(h)
@@ -59,22 +59,22 @@ def olens_read(model, tokenizer, h: Tensor, layer: int, contract: dict, n: int =
     ids, slot = olens_prompt(tokenizer, layer, contract, chars)
     kw = {**contract["sampling"], **sampling}
     max_new_tokens = kw.pop("max_new_tokens")
-    texts = inject_generate(model, tokenizer, ids, model.get_input_embeddings(), [slot], t.atleast_2d(h).repeat_interleave(n, 0), lambda orig, v: contract["alpha"] * normed(v), max_new_tokens=max_new_tokens, seed=seed, **kw)
-    items = texts if raw else [parse_bullets(text) for text in texts]
-    rows = [items[i:i + n] for i in range(0, len(items), n)]
-    return rows[0] if h.ndim == 1 else rows
+    hs = t.atleast_2d(h)
+    rows = inject_generate(model, tokenizer, ids, model.get_input_embeddings(), [slot], hs.repeat_interleave(n, 0), lambda orig, v: contract["alpha"] * normed(v), max_new_tokens=max_new_tokens, seed=seed, **kw)
+    hc = hs.float().cpu()
+    return [{"layer": layer, "i": k // n, "j": k % n, "h": hc[k // n], **r, "bullets": parse_bullets(r["text"])} for k, r in enumerate(rows)]
 
-def olens_readout(cache, layers, pos: int | list[int], model, tokenizer, contract: dict, n: int = 1, seed: int | None = 0, raw: bool = False, hook: str = "hook_resid_post", input_src=None, title: str = "oracle lens readout", ctx: int = 32, chars: Iterable[str] | None = None, **sampling) -> dict:
+def olens_readout(cache, layers, pos: int | list[int], model, tokenizer, contract: dict, n: int = 1, seed: int | None = 0, raw: bool = False, hook: str = "hook_resid_post", input_src=None, title: str = "oracle lens readout", ctx: int = 32, chars: Iterable[str] | None = None, **sampling) -> list[dict]:
     """Tabbed oracle-lens readout of a run_with_cache cache of one prompt: a tab per layer and, when `pos` is a list, a second bar of tabs per position; a pane holds the n samples as small tables, one bullet per row (one line per row with raw=True). input_src (see get_toks) puts a token strip above the bars marking the positions read out, and clicking a marked token switches to it.
-    `hook` is hook_resid_post because the contract's "layer L" is the output of block L, where the lens readouts of mechtools.lens default to hook_resid_pre. The cache must come from a forward with the lens disabled (`with model.disable_adapter(): _, cache = bridge.run_with_cache(ids)`), since the lens's own activations give plausible, wrong readouts; `model` is the PeftModel with the lens active, read through one batched olens_read per layer over all positions, with `sampling` kwargs (do_sample=False for greedy, temperature, ...) overriding the contract's. Returns {layer: {pos: [items]}} for a list of positions and {layer: [items]} for an int, like cluster_readout, with items as olens_read gives them."""
+    `hook` is hook_resid_post because the contract's "layer L" is the output of block L, where the lens readouts of mechtools.lens default to hook_resid_pre. The cache must come from a forward with the lens disabled (`with model.disable_adapter(): _, cache = bridge.run_with_cache(ids)`), since the lens's own activations give plausible, wrong readouts; `model` is the PeftModel with the lens active, read through one batched olens_read per layer over all positions, with `sampling` kwargs (do_sample=False for greedy, temperature, ...) overriding the contract's. Returns olens_read's records with `pos` (as given) added, layer-major, then position-major."""
     positions = [pos] if isinstance(pos, int) else list(pos)
     if len(set(positions)) != len(positions):
         raise ValueError(f"pos has repeated positions: {positions}")
     toks, ids = get_toks(input_src, tokenizer)
-    out, panes = {}, {}
+    recs, panes = [], {}
     for layer in layers:
-        samples = olens_read(model, tokenizer, cache[f"blocks.{layer}.{hook}"][0, positions], layer, contract, n, seed, raw, chars, **sampling)
-        out[layer] = dict(zip(positions, samples))
-        panes[f"L{layer}"] = {f"p{p}": [(f"sample {j}", [[line] for line in (s.splitlines() if raw else s)], None, ["w"]) for j, s in enumerate(ss)] for p, ss in out[layer].items()}  # one wrapping column ('w'): the bullets wrap inside the frame instead of pushing the sample tables past it
+        rs = [{"layer": layer, "pos": positions[r["i"]], **r} for r in olens_read(model, tokenizer, cache[f"blocks.{layer}.{hook}"][0, positions], layer, contract, n, seed, chars, **sampling)]
+        recs += rs
+        panes[f"L{layer}"] = {f"p{p}": [(f"sample {r['j']}", [[line] for line in (r["text"].splitlines() if raw else r["bullets"])], None, ["w"]) for r in rs if r["pos"] == p] for p in positions}  # one wrapping column ('w'): the bullets wrap inside the frame instead of pushing the sample tables past it
     display(HTML(readout_html(tabbed(panes, token_strip(toks, ids, pos, ctx) if toks is not None else ""), title, n_cols=min(n, 4))))
-    return out if isinstance(pos, list) else {layer: v[pos] for layer, v in out.items()}
+    return recs

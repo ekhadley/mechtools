@@ -163,7 +163,7 @@ def test_show_logits_marks_every_position_and_the_actual_next_token(shown):
     logits = t.zeros(3, 8)
     logits[0, 1] = 9.0  # pos 0 predicts the actual next id, 1
     logits[1] = t.tensor([9., 8., 7., 6., 0., 5., 4., 3.])  # pos 1's actual next id, 4, is ranked last
-    show_logits([3, 1, 4], logits=logits, tokenizer=tok, k=3)
+    assert show_logits([3, 1, 4], logits=logits, tokenizer=tok, k=3) is logits  # the logits read out come back
     h = shown[0]
     d = widget_data(h)
     assert d["tabs"] == [""] and d["inner"] == ["p0", "p1", "p2"] and h.count("data-p=") == 3 and h.count("class='tb' hidden") == 2  # a pane and a clickable token per position, no tab bars
@@ -187,9 +187,10 @@ def test_show_logits_inputs(shown):
         show_logits(None, logits=t.randn(3, 8), tokenizer=tok)
     with pytest.raises(ValueError, match=r"repeats a position once wrapped: \[2, 2\]"):
         show_logits([3, 1, 4], logits=t.randn(3, 8), tokenizer=tok, pos=[-1, 2])  # one mark per pane
-    show_logits([3, 1, 4], logits=t.randn(1, 3, 8), tokenizer=tok, pos=[-1], k=2)
+    batched = t.randn(1, 3, 8)
+    assert t.equal(show_logits([3, 1, 4], logits=batched, tokenizer=tok, pos=[-1], k=2), batched[0])  # returned without the batch of one
     assert "application/json" not in shown[-1] and first_pane(shown[-1]).count("<tr") == 3 and "data-p=0 class=on data-h='pos 2" in shown[-1] and "<h3" in shown[-1]  # one position: one rendered pane, no payload
-    show_logits("one two", model=FakeModel(), k=2, title=None)  # a string is tokenized (with BOS) and run through the model
+    assert show_logits("one two", model=FakeModel(), k=2, title=None).shape == (3, 6)  # a string is tokenized (with BOS) and run through the model, whose logits come back
     assert len(widget_data(shown[-1])["inner"]) == 3 and "<h3" not in shown[-1]
     show_logits(["a", "b"], logits=t.randn(2, 8), tokenizer=tok)  # str tokens with logits: no ids, so no next-token coloring
     d = widget_data(shown[-1])
@@ -261,7 +262,8 @@ def test_lens_readouts_with_fake_cache(shown):
     jl = {"J": t.stack([t.eye(d) * (l + 1) for l in range(3)])}
     h = cache["blocks.1.hook_resid_pre"][0, -1]
     assert t.allclose(get_lens_logits(h, 1, m, jl), 2 * h @ m.W_U) and t.allclose(jlens_transport(h, 2, jl), 3 * h)
-    jlens_readout(cache, [0, 2], -1, m, jl, k=2, input_src=[3, 1, 4, 1, 5])
+    scores = jlens_readout(cache, [0, 2], -1, m, jl, k=2, input_src=[3, 1, 4, 1, 5])
+    assert list(scores) == [0, 2] and t.allclose(scores[2], 3 * cache["blocks.2.hook_resid_pre"][0, -1] @ m.W_U) and t.allclose(scores[0], cache["blocks.0.hook_resid_pre"][0, -1] @ m.W_U)  # {layer: logits}
     out = shown[-1]
     assert out.count("<table>") == 2 and "<th colspan=2>L0</th>" in out and "<th colspan=2>L2</th>" in out and out.count("<tr") == 6
     top = (3 * cache["blocks.2.hook_resid_pre"][0, -1] @ m.W_U).softmax(-1).topk(2)
@@ -272,15 +274,18 @@ def test_lens_readouts_with_fake_cache(shown):
     sc = get_tlens_scores(h, 1, tl)
     assert sc.shape == (5,) and t.allclose(sc, t.cosine_similarity(tl["templates"][1], h[None], dim=-1))
     assert get_template_idx("tpl3", tl) == 3 and t.equal(get_template_vec("tpl3", 1, tl), tl["templates"][1, 3]) and get_template_vecs(["tpl0", "tpl4"], 2, tl).shape == (2, d)
-    tlens_readout(cache, [1], -1, tl, k=3, tokenizer=m.tokenizer, input_src="a b")
+    scores = tlens_readout(cache, [1], -1, tl, k=3, tokenizer=m.tokenizer, input_src="a b")
+    assert list(scores) == [1] and t.equal(scores[1], sc)  # {layer: cosines}
     out = shown[-1]
     assert out.count("<table>") == 1 and f"<td>'tpl{sc.argmax().item()}'</td><td class=v>{fmt3(sc.max().item())}" in out
     labels = t.tensor([0, 1, 0, 1, 0, 1])
-    ids = jlens_cluster_readout(cache, [0, 1], [1, 3], m, jl, labels, n_clusters=2, n_rows=2, input_src=[3, 1, 4, 1, 5])
+    scores, ids = jlens_cluster_readout(cache, [0, 1], [1, 3], m, jl, labels, n_clusters=2, n_rows=2, input_src=[3, 1, 4, 1, 5])
     data = widget_data(shown[-1])
-    assert list(ids) == ["L0", "L1"] and list(ids["L0"]) == [1, 3] and data["tabs"] == ["L0", "L1"] and data["inner"] == ["p1", "p3"] and shown[-1].count("data-p=") == 2
-    ids = tlens_cluster_readout(cache, [0], -1, tl, k=2, n_clusters=2, n_rows=2, tokenizer=m.tokenizer)
-    assert list(ids) == ["L0"] and sorted(ids["L0"]) == [0, 1] and "application/json" not in shown[-1] and shown[-1].count("<table>") == 3  # one layer at one position: one rendered pane, no payload
+    assert list(ids) == [0, 1] and list(ids[0]) == [1, 3] and data["tabs"] == ["L0", "L1"] and data["inner"] == ["p1", "p3"] and shown[-1].count("data-p=") == 2
+    assert list(scores) == [0, 1] and list(scores[1]) == [1, 3] and t.allclose(scores[1][3], 2 * cache["blocks.1.hook_resid_pre"][0, 3] @ m.W_U)  # {layer: {pos: logits}}, keyed like the shown cluster ids
+    scores, ids = tlens_cluster_readout(cache, [0], -1, tl, k=2, n_clusters=2, n_rows=2, tokenizer=m.tokenizer)
+    assert list(ids) == [0] and sorted(ids[0]) == [0, 1] and "application/json" not in shown[-1] and shown[-1].count("<table>") == 3  # one layer at one position: one rendered pane, no payload
+    assert list(scores) == [0] and t.equal(scores[0], get_tlens_scores(cache["blocks.0.hook_resid_pre"][0, -1], 0, tl))  # an int pos: {layer: cosines}
 
 def test_vocab_vecs_and_cluster_vocab():
     m = FakeModel(d=4, vocab=30)
@@ -303,8 +308,8 @@ def test_bridge_readouts(tiny_bridge, shown):
     ids = t.tensor([model.tokenizer.encode("Hello there")])
     _, cache = model.run_with_cache(ids)
     J = {"J": t.eye(model.cfg.d_model)[None].repeat(model.cfg.n_layers, 1, 1)}
-    jlens_readout(cache, [0, 1], -1, model, J, k=3, input_src="Hello there")
-    assert shown[-1].count("<table>") == 2
+    scores = jlens_readout(cache, [0, 1], -1, model, J, k=3, input_src="Hello there")
+    assert shown[-1].count("<table>") == 2 and scores[1].shape == (model.cfg.d_vocab,)
     tok_id = model.tokenizer.encode("Hello", add_special_tokens=False)[0]
     assert tok_id != model.tokenizer.bos_token_id and t.allclose(get_jlens_token_vec("Hello", 0, model, J), model.W_U[:, tok_id])
     assert vocab_vecs(model).shape == (model.cfg.d_vocab, model.cfg.d_model)

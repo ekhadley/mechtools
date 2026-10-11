@@ -27,8 +27,9 @@ def logits(model, ids):
     return model(input_ids=t.tensor([ids])).logits
 
 def cut(tok, row, eos=(1, 2)):
-    """The decoded row up to its first eos id, as inject_generate returns it."""
-    return tok.decode(row[:next((i for i, x in enumerate(row) if x in eos), len(row))], skip_special_tokens=True)
+    """The record inject_generate returns for a generated row: its ids up to the first eos id, decoded, and whether an eos was found."""
+    ids = row[:next((i for i, x in enumerate(row) if x in eos), len(row))]
+    return {"text": tok.decode(ids, skip_special_tokens=True), "ids": ids, "stopped": len(ids) < len(row)}
 
 def save_lora(path, targets, seed) -> str:
     """A LoRA on TINY_MODEL saved to `path`, with lora_B drawn at random: it is zero at init, which would make the adapter the identity."""
@@ -278,7 +279,7 @@ def test_embed_replace_matches_a_hand_built_inputs_embeds_generate(plain, tok, i
         e[:, POS] = VECS
         out = plain.generate(inputs_embeds=e, attention_mask=t.ones_like(prompt), eos_token_id=[1, 2], pad_token_id=0, **GREEDY)
         ref = plain.generate(input_ids=prompt, attention_mask=t.ones_like(prompt), eos_token_id=[1, 2], pad_token_id=0, **GREEDY)
-    assert len(texts) == 3 and all(isinstance(s, str) for s in texts)
+    assert len(texts) == 3 and all(isinstance(r["text"], str) and isinstance(r["ids"], list) and isinstance(r["stopped"], bool) for r in texts)
     assert texts == [cut(tok, row) for row in out.tolist()]  # with inputs_embeds, generate returns the new tokens only
     assert texts != inject_generate(plain, tok, ids, embed, POS, VECS, lambda o, v: o, **GREEDY) == [cut(tok, row) for row in ref[:, len(ids):].tolist()]  # the identity write is plain generation
 
@@ -342,7 +343,7 @@ def test_seed_controls_sampling(plain, tok, ids):
         return inject_generate(plain, tok, ids, plain.get_input_embeddings(), POS, vecs, lambda o, v: v, **{**sample, **kw})
     assert run(seed=1) == run(seed=1) != run(seed=2)
     same = VECS[:1].expand(3, 2, 16)
-    assert len(set(run(same, seed=1))) == 3 and len(set(run(same, do_sample=False))) == 1  # identical rows are sampled independently; greedy decoding shows they are identical
+    assert len({r["text"] for r in run(same, seed=1)}) == 3 and len({r["text"] for r in run(same, do_sample=False)}) == 1  # identical rows are sampled independently; greedy decoding shows they are identical
     t.manual_seed(1)
     assert run(seed=None) == run(seed=1)  # None leaves the RNG alone
 
@@ -375,7 +376,7 @@ def test_hook_rewrites_the_first_element_of_a_tuple_output_in_the_activations_dt
     def write(o, v):
         dtypes.append((o.dtype, v.dtype))
         return v.double()
-    assert inject_generate(plain, tok, ids, block, [4], VECS[:, 0].bfloat16(), write, **GREEDY) == ["", "", ""]
+    assert inject_generate(plain, tok, ids, block, [4], VECS[:, 0].bfloat16(), write, **GREEDY) == [{"text": "", "ids": [], "stopped": False}] * 3
     (new, extra), (step, _) = seen
     assert extra == "cache" and new.dtype == t.bfloat16 and dtypes == [(t.float32, t.float32)]
     assert t.equal(new[:, 4], VECS[:, 0].bfloat16()) and new[:, [p for p in range(len(ids)) if p != 4]].abs().sum() == 0
@@ -392,8 +393,9 @@ def test_generate_gets_both_eos_ids_the_pad_id_and_the_kwargs_and_rows_are_cut_a
         seen.update(kw)
         return t.cat([kw["input_ids"], tails], 1)
     monkeypatch.setattr(plain, "generate", generate)
-    texts = inject_generate(plain, tok, ids, plain.get_input_embeddings(), POS, VECS, lambda o, v: v, max_new_tokens=7, do_sample=False, top_k=3)
-    assert texts == [tok.decode(words[:2]), "", tok.decode(words[:3])]  # cut at the first eos id; special tokens (the pad) dropped
+    rows = inject_generate(plain, tok, ids, plain.get_input_embeddings(), POS, VECS, lambda o, v: v, max_new_tokens=7, do_sample=False, top_k=3)
+    assert [r["text"] for r in rows] == [tok.decode(words[:2]), "", tok.decode(words[:3])]  # cut at the first eos id; special tokens (the pad) dropped from the text
+    assert [r["ids"] for r in rows] == [words[:2], [], [words[0], 0, words[1], words[2]]] and [r["stopped"] for r in rows] == [True, True, False]  # the ids keep every sampled id before the eos; the third row has no eos id, so it ran to max_new_tokens
     assert t.equal(seen["input_ids"], t.tensor([ids] * 3)) and t.equal(seen["attention_mask"], t.ones(3, len(ids), dtype=t.long))
     assert seen["eos_token_id"] == [1, 2] and seen["pad_token_id"] == 0  # the generation config's eos and the tokenizer's
     assert seen["max_new_tokens"] == 7 and seen["do_sample"] is False and seen["top_k"] == 3

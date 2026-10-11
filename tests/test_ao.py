@@ -17,6 +17,7 @@ AO_CONFIG = {"special_token": " ?", "hook_onto_layer": 1, "steering_coefficient"
 CONFIG = {**AO_CONFIG, "adapter": "ao", "op": "add"}  # what load_ao returns for AO_CONFIG
 SPECIAL_ID = 1577  # " ?" on the tiny Llama-2 tokenizer
 D = 16
+texts = lambda recs: [r["text"] for r in recs]
 
 def tiny_hf():
     try:
@@ -68,11 +69,11 @@ def no_generate(monkeypatch):
 
 @pytest.fixture
 def captured(monkeypatch):
-    """inject_generate replaced by a recorder of every call's arguments, answering one numbered string per row of vecs."""
+    """inject_generate replaced by a recorder of every call's arguments, answering one row per row of vecs, its text a numbered string."""
     calls = []
     def fake(model, tokenizer, ids, module, positions, vecs, write, max_new_tokens, seed, **kw):
         calls.append(dict(model=model, tokenizer=tokenizer, ids=ids, module=module, positions=positions, vecs=vecs, write=write, max_new_tokens=max_new_tokens, seed=seed, kw=kw))
-        return [f"answer {len(calls)} row {i}" for i in range(vecs.shape[0])]
+        return [{"text": f"answer {len(calls)} row {i}", "ids": [i], "stopped": True} for i in range(vecs.shape[0])]
     monkeypatch.setattr(ao, "inject_generate", fake)
     return calls
 
@@ -132,7 +133,7 @@ def test_load_ao(ao_repo, tok, captured):
     with pytest.raises(RuntimeError, match=r"active adapters \['ao'\] are not \['old'\]"):
         ao_read(model2, tok, t.randn(D), 0, "q", config2)
     model2.set_adapter("old")
-    assert ao_read(model2, tok, t.randn(D), 0, "q", config2) == ["answer 1 row 0"] and model2.active_adapters == ["old"]
+    assert texts(ao_read(model2, tok, t.randn(D), 0, "q", config2)) == ["answer 1 row 0"] and model2.active_adapters == ["old"]
     with pytest.raises(ValueError, match="already loaded"):
         load_ao(model, ao_repo)
 
@@ -193,7 +194,9 @@ def test_ao_read_plumbing(oracle, tok, captured):
     model, config = oracle
     hs = t.randn(3, D)
     out = ao_read(model, tok, hs, 1, "Which language?", config, n=4, max_new_tokens=7, seed=3)
-    assert out == [f"answer 1 row {i}" for i in range(4)]
+    assert [list(r) for r in out] == [["layer", "question", "j", "h", "text", "ids", "stopped"]] * 4  # one record per answer
+    assert [(r["layer"], r["question"], r["j"], r["text"], r["ids"], r["stopped"]) for r in out] == [(1, "Which language?", j, f"answer 1 row {j}", [j], True) for j in range(4)]
+    assert all(t.equal(r["h"], hs) and r["h"].device.type == "cpu" for r in out)  # the [k, d] activations written
     call, = captured
     ids, positions = ao_prompt(tok, config, 1, 3, "Which language?")
     assert call["model"] is model and call["tokenizer"] is tok and call["ids"] == ids and call["positions"] == positions and len(positions) == 3
@@ -212,8 +215,9 @@ def test_ao_read_plumbing(oracle, tok, captured):
     ao_read(model, tok, hs, 1, "q", {**config, "op": "replace", "steering_coefficient": 2.0})
     written = captured[-1]["write"](orig, v)
     assert t.allclose(written, 2.0 * orig.norm(dim=-1, keepdim=True) * unit, atol=1e-5) and t.allclose(written.norm(dim=-1), 2.0 * orig.norm(dim=-1), atol=1e-4)
-    ao_read(model, tok, hs[0], 0, "q", {**config, "hook_onto_layer": 0})  # [d] is one activation; the injection block comes from the config
+    one = ao_read(model, tok, hs[0], 0, "q", {**config, "hook_onto_layer": 0})  # [d] is one activation; the injection block comes from the config
     call = captured[-1]
+    assert t.equal(one[0]["h"], hs[:1]) and one[0]["layer"] == 0  # a [d] vector is held as [1, d]
     assert call["vecs"].shape == (1, 1, D) and t.equal(call["vecs"][0, 0], hs[0]) and len(call["positions"]) == 1 and call["module"] is decoder_layers(model)[0] and "Layer: 0\n" in tok.decode(call["ids"])
     ao_read(model, tok, hs, 1, "q", config, do_sample=True, temperature=0.7, top_p=0.9)
     assert captured[-1]["kw"] == {"do_sample": True, "temperature": 0.7, "top_p": 0.9} and captured[-1]["max_new_tokens"] == 50 and captured[-1]["seed"] == 0
@@ -226,18 +230,18 @@ def test_ao_read_generates(booted):
     tok = bridge.tokenizer
     hs = t.randn(2, D)
     out = ao_read(model, tok, hs, 1, "What is here?", config, n=3, max_new_tokens=3)
-    assert len(out) == 3 and all(isinstance(s, str) for s in out) and len(set(out)) == 1  # greedy rows of one prompt agree
-    assert out[:1] == ao_read(model, tok, hs, 1, "What is here?", config, max_new_tokens=3)
+    assert len(out) == 3 and all(r["text"] == tok.decode(r["ids"], skip_special_tokens=True) and len(r["ids"]) <= 3 for r in out) and len(set(texts(out))) == 1  # greedy rows of one prompt agree
+    assert texts(out)[:1] == texts(ao_read(model, tok, hs, 1, "What is here?", config, max_new_tokens=3))
     assert not decoder_layers(model)[1]._forward_hooks  # the injection hook is gone
     sampled = ao_read(model, tok, hs, 1, "What is here?", config, n=2, max_new_tokens=4, seed=1, do_sample=True, temperature=1.0, top_k=0)
-    assert len(sampled) == 2 and sampled == ao_read(model, tok, hs, 1, "What is here?", config, n=2, max_new_tokens=4, seed=1, do_sample=True, temperature=1.0, top_k=0)
+    assert len(sampled) == 2 and texts(sampled) == texts(ao_read(model, tok, hs, 1, "What is here?", config, n=2, max_new_tokens=4, seed=1, do_sample=True, temperature=1.0, top_k=0))
     # The injection reaches the generated text only when a block follows the injection block: block 1 is this 2-layer model's last, so a write at a placeholder position of its output never reaches the last position's logits, whatever the op or coefficient. Injected at block 0's output, a random vector changes the greedy continuation.
     ids, positions = ao_prompt(tok, config, 0, 1, "q")
-    none = inject_generate(model, tok, ids, decoder_layers(model)[0], positions, t.zeros(1, D), lambda orig, vecs: orig, 8, 0, do_sample=False)
+    none = texts(inject_generate(model, tok, ids, decoder_layers(model)[0], positions, t.zeros(1, D), lambda orig, vecs: orig, 8, 0, do_sample=False))
     g = t.Generator().manual_seed(0)
-    assert any(ao_read(model, tok, t.randn(D, generator=g), 0, "q", {**config, "hook_onto_layer": 0}, max_new_tokens=8) != none for _ in range(8))  # the default add at coefficient 1.0
-    assert any(ao_read(model, tok, t.randn(D, generator=g), 0, "q", {**config, "hook_onto_layer": 0, "op": "replace"}, max_new_tokens=8) != none for _ in range(8))
-    assert all(ao_read(model, tok, t.randn(D, generator=g), 0, "q", {**config, "op": "replace", "steering_coefficient": 50.0}, max_new_tokens=8) == none for _ in range(4))
+    assert any(texts(ao_read(model, tok, t.randn(D, generator=g), 0, "q", {**config, "hook_onto_layer": 0}, max_new_tokens=8)) != none for _ in range(8))  # the default add at coefficient 1.0
+    assert any(texts(ao_read(model, tok, t.randn(D, generator=g), 0, "q", {**config, "hook_onto_layer": 0, "op": "replace"}, max_new_tokens=8)) != none for _ in range(8))
+    assert all(texts(ao_read(model, tok, t.randn(D, generator=g), 0, "q", {**config, "op": "replace", "steering_coefficient": 50.0}, max_new_tokens=8)) == none for _ in range(4))
 
 @pytest.mark.hf
 def test_ao_readout_plumbing(oracle, tok, captured, shown):
@@ -247,8 +251,8 @@ def test_ao_readout_plumbing(oracle, tok, captured, shown):
     questions = ["What topic?", "Which <language>?"]
     answers = ao_readout(cache, [0, 1], [3, -1], model, tok, config, questions, window=2, max_new_tokens=5, seed=4, input_src=list(range(10, 19)))
     assert len(captured) == 8 and all(c["vecs"].shape == (1, 2, D) and len(c["positions"]) == 2 and c["max_new_tokens"] == 5 and c["seed"] == 4 and c["kw"] == {"do_sample": False} for c in captured)
-    assert list(answers) == [0, 1] and list(answers[0]) == [3, -1] and list(answers[0][3]) == questions
-    assert answers[0][3] == {"What topic?": "answer 1 row 0", "Which <language>?": "answer 2 row 0"} and answers[0][-1]["What topic?"] == "answer 3 row 0" and answers[1][3]["What topic?"] == "answer 5 row 0" and answers[1][-1]["Which <language>?"] == "answer 8 row 0"
+    assert [(r["layer"], r["pos"], r["question"], r["text"]) for r in answers] == [(l, p, q, f"answer {k + 1} row 0") for k, (l, p, q) in enumerate((l, p, q) for l in (0, 1) for p in (3, -1) for q in questions)]  # ao_read's records with the position as given: layer-major, then position, then question
+    assert t.equal(answers[2]["h"], cache["blocks.0.hook_resid_post"][0, 7:9]) and t.equal(answers[5]["h"], cache["blocks.1.hook_resid_post"][0, 2:4])  # the window of activations read
     assert t.equal(captured[0]["vecs"][0], cache["blocks.0.hook_resid_post"][0, 2:4]) and t.equal(captured[2]["vecs"][0], cache["blocks.0.hook_resid_post"][0, 7:9]) and t.equal(captured[5]["vecs"][0], cache["blocks.1.hook_resid_post"][0, 2:4])
     assert "Layer: 0\n" in tok.decode(captured[0]["ids"]) and "Layer: 1\n" in tok.decode(captured[4]["ids"])
     h = shown[-1]
@@ -258,10 +262,10 @@ def test_ao_readout_plumbing(oracle, tok, captured, shown):
     assert d["panes"][0][0] is None and [tb[1][1][0] for row in d["panes"] for pane in row if pane for tb in pane] == ["Which <language>?"] * 3 and d["panes"][1][1] == [[["L1", "p7..p8"], [["What topic?", "answer 7 row 0"], ["Which <language>?", "answer 8 row 0"]], None, [None, "w"]]]  # a table per pane, a row per question
     assert h.count("<tr") == 3 and "<th colspan=2>L0 &middot; p2..p3</th>" in h and "<td>Which &lt;language&gt;?</td><td class=w><div>answer 2 row 0</div></td>" in h and "activation oracle readout</h3>" in h  # the first pane rendered
     answers = ao_readout(cache, [0], 2, model, tok, config, ["q"], hook="hook_resid_pre", title="T")
-    assert answers == {0: {"q": "answer 9 row 0"}} and t.equal(captured[-1]["vecs"][0], cache["blocks.0.hook_resid_pre"][0, 2:3])  # an int pos collapses the position level, like cluster_readout
+    assert [(r["layer"], r["pos"], r["question"], r["text"]) for r in answers] == [(0, 2, "q", "answer 9 row 0")] and t.equal(captured[-1]["vecs"][0], cache["blocks.0.hook_resid_pre"][0, 2:3])
     h = shown[-1]
     assert "application/json" not in h and first_pane(h) == readout_grid([(["L0", "p2"], [["q", "answer 9 row 0"]], None, [None, "w"])]) and h.count("class='tb' hidden") == 2 and "data-p=" not in h and "<th colspan=2>L0 &middot; p2</th>" in h and "T</h3>" in h
-    assert ao_readout(cache, [0, 1], -1, model, tok, config, ["q"], input_src=list(range(9))) == {0: {"q": "answer 10 row 0"}, 1: {"q": "answer 11 row 0"}} and t.equal(captured[-1]["vecs"][0], cache["blocks.1.hook_resid_post"][0, 8:9]) and "data-h='pos 8 &middot; id 8" in shown[-1] and "outline:1px solid #fc6" in shown[-1] and "data-p=" not in shown[-1]  # an int pos marks the token without making it a tab
+    assert texts(ao_readout(cache, [0, 1], -1, model, tok, config, ["q"], input_src=list(range(9)))) == ["answer 10 row 0", "answer 11 row 0"] and t.equal(captured[-1]["vecs"][0], cache["blocks.1.hook_resid_post"][0, 8:9]) and "data-h='pos 8 &middot; id 8" in shown[-1] and "outline:1px solid #fc6" in shown[-1] and "data-p=" not in shown[-1]  # an int pos marks the token without making it a tab
     n_calls, n_shown = len(captured), len(shown)
     with pytest.raises(ValueError, match="a window of 2 at position 0 reaches outside the 9-token sequence"):
         ao_readout(cache, [0], 0, model, tok, config, ["q"], window=2)
@@ -295,8 +299,8 @@ def test_ao_readout_from_bridge_cache(booted, shown):
     assert not t.allclose(bridge.run_with_cache(t.tensor([ids]))[1]["blocks.0.hook_resid_post"], ref[1], atol=1e-5)  # with the adapter active it would be the oracle's
     questions = ["What topic?", "Which language?"]
     answers = ao_readout(cache, [0, 1], [-1, -3], model, tok, config, questions, input_src=ids, max_new_tokens=3)
-    assert list(answers) == [0, 1] and list(answers[0]) == [-1, -3] and all(isinstance(a, str) for by_pos in answers.values() for by_q in by_pos.values() for a in by_q.values())
-    assert answers[1][-1]["What topic?"] == ao_read(model, tok, cache["blocks.1.hook_resid_post"][0, -1], 1, "What topic?", config, max_new_tokens=3)[0]
+    assert [(r["layer"], r["pos"], r["question"]) for r in answers] == [(l, p, q) for l in (0, 1) for p in (-1, -3) for q in questions] and all(isinstance(r["text"], str) for r in answers)
+    assert answers[4]["text"] == ao_read(model, tok, cache["blocks.1.hook_resid_post"][0, -1], 1, "What topic?", config, max_new_tokens=3)[0]["text"]
     h = shown[-1]
     d = widget_data(h)
     assert d["tabs"] == ["L0", "L1"] and d["inner"] == ["p-1", "p-3"] and "<button class=on>L0</button><button>L1</button>" in h and "<button class=on>p-1</button><button>p-3</button>" in h and h.count("data-p=") == 2

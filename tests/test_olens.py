@@ -15,6 +15,7 @@ from mechtools.tokens import single_token_marker
 D = 16
 GREEDY = {"do_sample": False, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 3}
 td = lambda s: f"<td class=w><div>{s}</div></td>"  # a readout cell in the wrapping column: its text in a div the frame caps at 100ch
+texts = lambda recs: [r["text"] for r in recs]
 
 @pytest.fixture(scope="module")
 def tok():
@@ -57,12 +58,12 @@ def shown(monkeypatch):
 
 @pytest.fixture
 def fake_generate(monkeypatch):
-    """inject_generate replaced by a recorder returning '- {i}a\\n- {i}b\\nnoise' for row i; `seen` holds the last call's arguments and, under "calls", every call's vecs."""
+    """inject_generate replaced by a recorder returning a row with the text '- {i}a\\n- {i}b\\nnoise' for row i; `seen` holds the last call's arguments and, under "calls", every call's vecs."""
     seen = {"calls": []}
     def fake(model, tokenizer, ids, module, positions, vecs, write, max_new_tokens, seed, **kw):
         seen.update(model=model, tokenizer=tokenizer, ids=ids, module=module, positions=positions, vecs=vecs.clone(), write=write, max_new_tokens=max_new_tokens, seed=seed, kw=kw)
         seen["calls"].append(vecs.clone())
-        return [f"- {i}a\n- {i}b\nnoise" for i in range(vecs.shape[0])]
+        return [{"text": f"- {i}a\n- {i}b\nnoise", "ids": [i], "stopped": True} for i in range(vecs.shape[0])]
     monkeypatch.setattr(olens, "inject_generate", fake)
     return seen
 
@@ -161,13 +162,16 @@ def test_olens_read_plumbing(lens, tok, fake_generate):
     w = seen["write"](orig, v)
     assert w.shape == (6, 1, D) and t.allclose(w, 7.0 * v / v.norm(dim=-1, keepdim=True), atol=1e-5) and t.allclose(w.norm(dim=-1), t.full((6, 1), 7.0), atol=1e-5)
     assert t.equal(seen["write"](t.zeros_like(orig), v), w) and t.equal(seen["write"](orig * 100, v), w)  # the original rows are ignored
-    assert out == [[["0a", "0b"], ["1a", "1b"], ["2a", "2b"]], [["3a", "3b"], ["4a", "4b"], ["5a", "5b"]]]
-    raw = olens_read(peft, tok, h[0], 0, c, n=2, raw=True, chars="ZQXJ")
-    assert raw == ["- 0a\n- 0b\nnoise", "- 1a\n- 1b\nnoise"] and seen["vecs"].shape == (2, D) and t.equal(seen["vecs"][1], h[0])
+    assert [list(r) for r in out] == [["layer", "i", "j", "h", "text", "ids", "stopped", "bullets"]] * 6  # one record per sample
+    assert [(r["layer"], r["i"], r["j"], r["bullets"], r["ids"]) for r in out] == [(1, i, j, [f"{3 * i + j}a", f"{3 * i + j}b"], [3 * i + j]) for i in range(2) for j in range(3)]  # activation-major, the row's fields passed through
+    assert out[5]["text"] == "- 5a\n- 5b\nnoise" and all(t.equal(r["h"], h[r["i"]]) and r["h"].device.type == "cpu" for r in out)
+    one = olens_read(peft, tok, h[0], 0, c, n=2, chars="ZQXJ")
+    assert texts(one) == ["- 0a\n- 0b\nnoise", "- 1a\n- 1b\nnoise"] and [(r["layer"], r["i"]) for r in one] == [(0, 0)] * 2 and seen["vecs"].shape == (2, D) and t.equal(seen["vecs"][1], h[0])  # [d] is activation 0
     assert seen["kw"] == {"do_sample": False, "temperature": 1.0, "top_p": 1.0, "top_k": 0} and seen["max_new_tokens"] == 3 and seen["seed"] == 0 and seen["ids"] == olens_prompt(tok, 0, c, chars="ZQXJ")[0]
-    assert olens_read(peft, tok, h[0], 0, c, chars="ZQXJ") == [["0a", "0b"]] and seen["vecs"].shape == (1, D)
-    assert olens_read(peft, tok, h[0].bfloat16(), 0, c, seed=None, chars="ZQXJ") == [["0a", "0b"]] and seen["vecs"].dtype == t.bfloat16 and seen["seed"] is None
-    assert olens_read(peft, tok, h[:1], 0, c, chars="ZQXJ") == [[["0a", "0b"]]]  # [1, d] keeps the outer list
+    assert [r["bullets"] for r in olens_read(peft, tok, h[0], 0, c, chars="ZQXJ")] == [["0a", "0b"]] and seen["vecs"].shape == (1, D)
+    half = olens_read(peft, tok, h[0].bfloat16(), 0, c, seed=None, chars="ZQXJ")
+    assert seen["vecs"].dtype == t.bfloat16 and seen["seed"] is None and half[0]["h"].dtype == t.float32 and t.equal(half[0]["h"], h[0].bfloat16().float())  # the records hold float32
+    assert [(r["i"], r["bullets"]) for r in olens_read(peft, tok, h[:1], 0, c, chars="ZQXJ")] == [(0, ["0a", "0b"])]  # [1, d] gives the records of [d]
     with pytest.raises(ValueError, match=r"\[d\] or \[m, d\], got \(2, 3, 16\)"):
         olens_read(peft, tok, t.randn(2, 3, D), 0, c, chars="ZQXJ")
     with pytest.raises(ValueError, match="n must be at least 1, got 0"):
@@ -178,20 +182,20 @@ def test_olens_read_end_to_end(lens, tok):
     h = t.randn(2, D)
     seen = []
     handle = decoder_layers(peft)[0].register_forward_pre_hook(lambda m, args, kwargs: seen.append(args[0].clone()), with_kwargs=True)
-    out = olens_read(peft, tok, h, 1, c, n=3, raw=True, chars="ZQXJ", max_new_tokens=1)
+    out = olens_read(peft, tok, h, 1, c, n=3, chars="ZQXJ", max_new_tokens=1)
     handle.remove()
     ids, slot = olens_prompt(tok, 1, c, chars="ZQXJ")
     x = seen[0]  # what block 0 saw on the prefill
     assert x.shape == (6, len(ids), D) and t.allclose(x[:, slot], 7.0 * normed(h).repeat_interleave(3, 0), atol=1e-5)  # alpha * unit(h), activation-major
     emb = peft.get_input_embeddings()(t.tensor([ids]))[0]
     assert t.allclose(x[:, :slot], emb[:slot].expand(6, -1, -1), atol=1e-6) and t.allclose(x[:, slot + 1:], emb[slot + 1:].expand(6, -1, -1), atol=1e-6)  # every other row is the prompt's embedding
-    assert len(out) == 2 and all(len(row) == 3 and all(isinstance(s, str) for s in row) for row in out)
-    a = olens_read(peft, tok, h, 1, c, n=2, raw=True, chars="ZQXJ", do_sample=True, top_p=0.95, top_k=64)
-    b = olens_read(peft, tok, h, 1, c, n=2, raw=True, chars="ZQXJ", do_sample=True, top_p=0.95, top_k=64)
-    assert a == b and len(a) == 2 and len(a[0]) == 2  # deterministic given (activations, n, seed): the same batch reproduces its block
-    assert olens_read(peft, tok, h[:1], 1, c, n=2, raw=True, chars="ZQXJ", do_sample=True, top_p=0.95, top_k=64) == [olens_read(peft, tok, h[0], 1, c, n=2, raw=True, chars="ZQXJ", do_sample=True, top_p=0.95, top_k=64)]  # [1, d] and [d] are the same batch
+    assert len(out) == 6 and all(isinstance(r["text"], str) and r["bullets"] == parse_bullets(r["text"]) and r["text"] == tok.decode(r["ids"], skip_special_tokens=True) and len(r["ids"]) <= 1 for r in out)
+    sample = dict(n=2, chars="ZQXJ", do_sample=True, top_p=0.95, top_k=64)
+    a = texts(olens_read(peft, tok, h, 1, c, **sample))
+    assert a == texts(olens_read(peft, tok, h, 1, c, **sample)) and len(a) == 4  # deterministic given (activations, n, seed): the same batch reproduces its block
+    assert texts(olens_read(peft, tok, h[:1], 1, c, **sample)) == texts(olens_read(peft, tok, h[0], 1, c, **sample))  # [1, d] and [d] are the same batch
     one = olens_read(peft, tok, h[0], 0, c, chars="ZQXJ")
-    assert len(one) == 1 and isinstance(one[0], list) and all(isinstance(s, str) for s in one[0])
+    assert len(one) == 1 and isinstance(one[0]["bullets"], list) and all(isinstance(s, str) for s in one[0]["bullets"])
 
 def test_olens_readout(lens, tok, fake_generate, shown, monkeypatch):
     peft, c, _ = lens
@@ -199,7 +203,8 @@ def test_olens_readout(lens, tok, fake_generate, shown, monkeypatch):
     toks = tok.encode("Hello there my old friend")
     cache = {f"blocks.{l}.hook_resid_post": t.randn(1, len(toks), D) for l in range(2)} | {"blocks.0.hook_resid_pre": t.randn(1, len(toks), D)}
     out = olens_readout(cache, [0, 1], [2, -1], peft, tok, c, n=2, seed=7, input_src=toks, chars="ZQXJ")
-    assert list(out) == [0, 1] and list(out[0]) == [2, -1] and out[0][2] == [["0a", "0b"], ["1a", "1b"]] and out[0][-1] == [["2a", "2b"], ["3a", "3b"]] and out[1] == out[0]
+    assert [(r["layer"], r["pos"], r["i"], r["j"], r["bullets"]) for r in out] == [(l, p, i, j, [f"{2 * i + j}a", f"{2 * i + j}b"]) for l in (0, 1) for i, p in enumerate((2, -1)) for j in range(2)]  # olens_read's records with the position as given, layer-major
+    assert all(t.equal(r["h"], cache[f"blocks.{r['layer']}.hook_resid_post"][0, r["pos"]]) for r in out)
     assert len(vecs) == 2 and all(v.shape == (4, D) for v in vecs) and all(t.equal(v, cache[f"blocks.{l}.hook_resid_post"][0, [2, -1]].repeat_interleave(2, 0)) for l, v in enumerate(vecs))  # one batched read per layer, positions in order
     assert seen["ids"] == olens_prompt(tok, 1, c, chars="ZQXJ")[0] and seen["max_new_tokens"] == 3 and seen["seed"] == 7
     h = shown[-1]
@@ -212,16 +217,16 @@ def test_olens_readout(lens, tok, fake_generate, shown, monkeypatch):
     assert seen["kw"]["do_sample"] is False and seen["max_new_tokens"] == 5  # sampling kwargs override the contract's through olens_read
     out = olens_readout(cache, [1], 3, peft, tok, c, title="T", input_src=toks, chars="ZQXJ")
     h = shown[-1]
-    assert out == {1: [["0a", "0b"]]} and "application/json" not in h and first_pane(h) == readout_grid([("sample 0", [["0a"], ["0b"]], None, ["w"])]) and h.count("class='tb' hidden") == 2 and "<span data-p=" not in h and h.count("outline:1px solid #fc6") == 1 and "T</h3>" in h and "--n:1;" in h and seen["seed"] == 0
+    assert [(r["layer"], r["pos"], r["bullets"]) for r in out] == [(1, 3, ["0a", "0b"])] and "application/json" not in h and first_pane(h) == readout_grid([("sample 0", [["0a"], ["0b"]], None, ["w"])]) and h.count("class='tb' hidden") == 2 and "<span data-p=" not in h and h.count("outline:1px solid #fc6") == 1 and "T</h3>" in h and "--n:1;" in h and seen["seed"] == 0
     out = olens_readout(cache, [0], [1], peft, tok, c, raw=True, hook="hook_resid_pre", chars="ZQXJ")
-    assert out == {0: {1: ["- 0a\n- 0b\nnoise"]}} and t.equal(vecs[-1], cache["blocks.0.hook_resid_pre"][0, [1]]) and td("- 0a") in shown[-1] and td("noise") in shown[-1] and shown[-1].count("<tr") == 4 and "class='tk'" not in shown[-1]  # raw: a line per row; no input_src, no strip
+    assert [(r["layer"], r["pos"], r["text"]) for r in out] == [(0, 1, "- 0a\n- 0b\nnoise")] and t.equal(vecs[-1], cache["blocks.0.hook_resid_pre"][0, [1]]) and td("- 0a") in shown[-1] and td("noise") in shown[-1] and shown[-1].count("<tr") == 4 and "class='tk'" not in shown[-1]  # raw: a line per row; no input_src, no strip
     n_calls = len(vecs)
     with pytest.raises(ValueError, match=r"repeated positions: \[2, 2\]"):
         olens_readout(cache, [0], [2, 2], peft, tok, c, chars="ZQXJ")
     with pytest.raises(ValueError, match="input_src is empty"):  # input_src is resolved before any generation
         olens_readout(cache, [0], 0, peft, tok, c, input_src=[], chars="ZQXJ")
     assert len(vecs) == n_calls and len(shown) == 4
-    monkeypatch.setattr(olens, "inject_generate", lambda *a, **kw: ["- a<b & c"])
+    monkeypatch.setattr(olens, "inject_generate", lambda *a, **kw: [{"text": "- a<b & c", "ids": [], "stopped": True}])
     olens_readout(cache, [0], 0, peft, tok, c, chars="ZQXJ")
     assert td("a&lt;b &amp; c") in shown[-1] and "application/json" not in shown[-1]  # escaped in the rendered pane; one pane, so no payload
     with pytest.raises(KeyError, match="blocks.5.hook_resid_post"):
@@ -240,7 +245,7 @@ def test_olens_readout_end_to_end(lens, tok, shown):
     _, cache_on = bridge.run_with_cache(t.tensor([ids]))
     assert not t.allclose(cache_on["blocks.1.hook_resid_post"], cache["blocks.1.hook_resid_post"])  # the lens's own activations differ from the base model's
     out = olens_readout(cache, [0, 1], [0, -1], peft, tok, c, n=2, input_src=ids, chars="ZQXJ")
-    assert list(out) == [0, 1] and list(out[1]) == [0, -1] and all(len(out[l][p]) == 2 and all(isinstance(s, list) for s in out[l][p]) for l in out for p in out[l])
+    assert [(r["layer"], r["pos"], r["j"]) for r in out] == [(l, p, j) for l in (0, 1) for p in (0, -1) for j in range(2)] and all(isinstance(r["bullets"], list) for r in out) and t.equal(out[-1]["h"], cache["blocks.1.hook_resid_post"][0, -1])
     assert [len(row) for row in widget_data(shown[-1])["panes"]] == [2, 2] and shown[-1].count("<span data-p=") == 2 and peft.active_adapters == ["olens"]
 
 @pytest.mark.hf
