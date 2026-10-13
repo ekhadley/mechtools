@@ -2,6 +2,7 @@ import pytest
 import torch as t
 from conftest import load_tokenizer
 
+import mechtools.tokens as mt
 from mechtools.colors import underline, endc
 from mechtools.tokens import *
 
@@ -75,6 +76,28 @@ def test_toks_html_vals():
     assert toks_html(["a", "b"], vals=[0, 0]).count("rgba(230,80,80,0.000)") == 2  # all-zero values: no division by zero, fully transparent shade
     with pytest.raises(ValueError, match="2 values for 3 tokens"):
         toks_html(["a", "b", "c"], vals=[1, 2])
+
+def test_toks_html_outline_vals():
+    h = toks_html(["a", "b", "c"], outline_vals=t.tensor([[2.0, -1.0, 0.0]]), outline_name="prob")
+    assert "box-shadow:inset 0 0 0 2px rgba(90,210,110,1.000)" in h and "rgba(220,90,220,0.500)" in h and "rgba(90,210,110,0.000)" in h and "&middot; prob -1'" in h and "--v:" not in h
+    assert toks_html(["a", "b"], outline_vals=[0, 0]).count("rgba(90,210,110,0.000)") == 2  # all-zero values: no division by zero
+    h = toks_html(["a", "b"], [5, 6], pos=0, vals=[1.0, -1.0], val_name="attr", outline_vals=[-3.0, 3.0], outline_name="prob")
+    assert "style='--v:rgba(230,80,80,0.850);box-shadow:inset 0 0 0 2px rgba(220,90,220,1.000);outline:1px solid #fc6'" in h  # fill, ring and pos outline on one token
+    assert "data-h='pos 1 &middot; id 6 &middot; &#x27;b&#x27; &middot; attr -1 &middot; prob 3'" in h
+    h = toks_html(["a", "b"], pos=[1], outline_vals=[1.0, 0.5])
+    assert "<span data-p=0 class=on" in h and "rgba(90,210,110,0.500)" in h  # tab targets keep their CSS outline under a ring
+    with pytest.raises(ValueError, match="outline_vals has 2 values for 3 tokens"):
+        toks_html(["a", "b", "c"], vals=[1, 2, 3], outline_vals=[1, 2])
+
+def test_show_toks_header(monkeypatch):
+    shown = []
+    monkeypatch.setattr(mt, "display", lambda h: shown.append(h.data))
+    show_toks([1, 2, 3], FakeTok(), vals=[1.0, -2.0, 0.5], val_name="attr", outline_vals=t.tensor([0.25, 4.0, -1.0]), outline_name="prob", title="T")
+    assert "T &middot; <span style='color:#888;font-weight:normal'>attr &isin; [-2, 1]</span> &middot; <span style='color:#888;font-weight:normal'>prob &isin; [-1, 4]</span></div>" in shown[0]
+    show_toks([1, 2, 3], FakeTok(), outline_vals=[1.0, 2.0, 3.0])
+    assert ">outline &isin; [1, 3]</span></div>" in shown[1] and "&middot;" not in shown[1].split("<style>")[0]
+    show_toks([1, 2, 3], FakeTok())
+    assert "margin-bottom:6px" not in shown[2]  # no title and no values: no header line
 
 def test_underline_stoks():
     s = underline_stoks([1, 2, 3], FakeTok())

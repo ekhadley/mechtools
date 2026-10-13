@@ -27,28 +27,37 @@ def to_str_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, add_speci
 
 TOKS_CSS = "<style>.tk{cursor:default;position:relative} .tk span{background:linear-gradient(var(--v,#0000),var(--v,#0000)),#1c1c1c} .tk span:hover{background:#3d4a5c;anchor-name:--tk} .tk span:hover::after{content:attr(data-h);position:absolute;position-anchor:--tk;position-area:bottom span-right;align-self:unsafe start;position-try-fallbacks:flip-inline,flip-block,flip-block flip-inline;z-index:9;background:#000;color:#ddd;border:1px solid #888;padding:1px 6px;font:11px/1.5 monospace;white-space:pre;pointer-events:none} .tk span[data-p]{cursor:pointer;outline:1px solid #666} .tk span[data-p].on{outline-color:#fc6}</style>"
 
-def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | list[int] | None = None, lo: int = 0, hi: int | None = None, vals: list[float] | Tensor | None = None, val_name: str = "value") -> str:
+def val_colors(vals: list[float], pos_rgb: str, neg_rgb: str, peak: float) -> list[str]:
+    """One rgba per value: pos_rgb for v >= 0, else neg_rgb, at opacity peak |v| / max|v| (all zeros give opacity 0)."""
+    scale = max(map(abs, vals), default=0) or 1
+    return [f"rgba({pos_rgb if v >= 0 else neg_rgb},{peak * abs(v) / scale:.3f})" for v in vals]
+
+def toks_html(strs: list[str], ids: list[int] | None = None, pos: int | list[int] | None = None, lo: int = 0, hi: int | None = None, vals: list[float] | Tensor | None = None, val_name: str = "value", outline_vals: list[float] | Tensor | None = None, outline_name: str = "outline") -> str:
     """strs[lo:hi] as spans on one flat background, the hovered token highlighted, hover showing position, id (if given) and repr of the string. The hover is a CSS tooltip under the token (CSS anchor positioning), flipping left or above at the strip's edges. An int `pos` puts an amber outline on that token; a list of positions outlines each one in gray as a clickable tab target (data-p is its index in the list; the enclosing widget gives the selected one class 'on', which turns its outline amber, and the first one carries it from the start, so it reads as selected where no script runs).
-    `vals`, one scalar per token, fills each token by its value: red for positive, blue for negative, opacity 0.85 |v| / max|v|; the hover then also shows `val_name` and the value. Put it inside a dark monospace container."""
+    `vals`, one scalar per token, fills each token by its value: red for positive, blue for negative, opacity 0.85 |v| / max|v|. `outline_vals`, one scalar per token, draws a 2px ring inside each token by its value: green for positive, magenta for negative, opacity |v| / max|v|. The ring is an inset box-shadow, so it sits alongside the fill and the `pos` outline. The hover also shows `val_name` and `outline_name` with each value given. Put it inside a dark monospace container."""
     hi = len(strs) if hi is None else hi
     sel = [p % len(strs) for p in ([] if pos is None else [pos] if isinstance(pos, int) else pos)] if strs else []
     tabs = {p: j for j, p in enumerate(sel)} if isinstance(pos, list) else {}
-    vals = None if vals is None else t.as_tensor(vals).flatten().float().tolist()
-    if vals is not None and len(vals) != len(strs):
-        raise ValueError(f"{len(vals)} values for {len(strs)} tokens")
-    scale = max((abs(v) for v in vals), default=0) or 1 if vals else 1
-    shade = lambda i: f"--v:rgba({'230,80,80' if vals[i] >= 0 else '80,130,230'},{0.85 * abs(vals[i]) / scale:.3f});" if vals else ""
-    spans = "".join(f"<span {f'data-p={tabs[i]} ' if i in tabs else ''}{'class=on ' if tabs.get(i) == 0 else ''}data-h='pos {i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}{f' &middot; {html.escape(val_name)} {vals[i]:.4g}' if vals else ''}' style='{shade(i)}{'outline:1px solid #fc6' if i in sel and not tabs else ''}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
+    vals, ovals = [None if v is None else t.as_tensor(v).flatten().float().tolist() for v in (vals, outline_vals)]
+    for v, name in ((vals, "vals"), (ovals, "outline_vals")):
+        if v is not None and len(v) != len(strs):
+            raise ValueError(f"{name} has {len(v)} values for {len(strs)} tokens")
+    fill = val_colors(vals, "230,80,80", "80,130,230", 0.85) if vals else None
+    ring = val_colors(ovals, "90,210,110", "220,90,220", 1.0) if ovals else None
+    style = lambda i: (f"--v:{fill[i]};" if fill else "") + (f"box-shadow:inset 0 0 0 2px {ring[i]};" if ring else "") + ("outline:1px solid #fc6" if i in sel and not tabs else "")
+    hover = lambda i: (f" &middot; {html.escape(val_name)} {vals[i]:.4g}" if vals else "") + (f" &middot; {html.escape(outline_name)} {ovals[i]:.4g}" if ovals else "")
+    spans = "".join(f"<span {f'data-p={tabs[i]} ' if i in tabs else ''}{'class=on ' if tabs.get(i) == 0 else ''}data-h='pos {i}{f' &middot; id {ids[i]}' if ids else ''} &middot; {html.escape(repr(s))}{hover(i)}' style='{style(i)}'>{html.escape(s).replace(chr(10), '↵\n')}</span>" for i, s in enumerate(strs[lo:hi], lo))
     return f"{TOKS_CSS}<div class='tk' style='white-space:pre-wrap;line-height:1.8'>{'… ' if lo > 0 else ''}{spans}{' …' if hi < len(strs) else ''}</div>"
 
-def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, vals: list[float] | Tensor | None = None, val_name: str = "value", title: str | None = None, add_special_tokens: bool = True, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
+def show_toks(inp: str | Tensor | list[int] | list[dict], tokenizer, pos: int | None = None, vals: list[float] | Tensor | None = None, val_name: str = "value", outline_vals: list[float] | Tensor | None = None, outline_name: str = "outline", title: str | None = None, add_special_tokens: bool = True, add_generation_prompt: bool = False, continue_final_message: bool = False, tools: list | None = None, chat_template: str | None = None, **template_kwargs):
     """Rich HTML display of a prompt's tokens, hover shows position, token id and repr, the token at pos (if given) outlined in amber.
-    `vals`, one scalar per token (list or tensor of shape [seq] or [1, seq]), shades each token by its value (red positive, blue negative, opacity relative to max |v|), names it `val_name` in the hover, and puts the value range in the header line with `title`.
+    `vals`, one scalar per token (list or tensor of shape [seq] or [1, seq]), fills each token by its value (red positive, blue negative, opacity relative to max |v|) and names it `val_name` in the hover. `outline_vals`, the same shape, draws a ring inside each token by its value (green positive, magenta negative, opacity relative to max |v|) and names it `outline_name`, so one strip shows two scalars per token. Each given one's range goes in the header line with `title`.
     add_special_tokens applies to a string (see to_ids). A conversation (list of role/content dicts) goes through apply_chat_template; the chat kwargs and any template_kwargs (e.g. enable_thinking=False for Qwen3) are forwarded to it."""
     ids = to_ids(inp, tokenizer, add_special_tokens, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message, tools=tools, chat_template=chat_template, **template_kwargs)
-    strip = toks_html([tokenizer.decode(i) for i in ids], ids, pos, vals=vals, val_name=val_name)
-    rng = f"<span style='color:#888;font-weight:normal'>{html.escape(val_name)} &isin; [{t.as_tensor(vals).min():.3g}, {t.as_tensor(vals).max():.3g}]</span>" if vals is not None else ""
-    head = f"<div style='margin-bottom:6px;font-weight:bold'>{html.escape(title) if title else ''}{' &middot; ' if title and rng else ''}{rng}</div>" if title or rng else ""
+    strip = toks_html([tokenizer.decode(i) for i in ids], ids, pos, vals=vals, val_name=val_name, outline_vals=outline_vals, outline_name=outline_name)
+    segs = [html.escape(title)] if title else []
+    segs += [f"<span style='color:#888;font-weight:normal'>{html.escape(name)} &isin; [{t.as_tensor(v).min():.3g}, {t.as_tensor(v).max():.3g}]</span>" for v, name in ((vals, val_name), (outline_vals, outline_name)) if v is not None]
+    head = f"<div style='margin-bottom:6px;font-weight:bold'>{' &middot; '.join(segs)}</div>" if segs else ""
     display(HTML(f"<div style='background:#111;color:#ddd;font:12px monospace;padding:8px'>{head}{strip}</div>"))
 
 def underline_stoks(toks: str | Tensor | list[int], tokenizer) -> str:
