@@ -135,7 +135,9 @@ A tabbed readout renders its first pane and ships the others as one JSON payload
 
 ### `olens`
 
-The oracle lens (Appendix A.9.2 of the workspace paper): a LoRA on the subject model that verbalizes one residual-stream activation as a list of bullet concepts. Checkpoints for Qwen3.6-27B (`agu18dec/olens_and_ar`, the default) and Qwen3-4B (`andyx10/oracle-lens-qwen3-4b`); each one's read contract (layers, alpha, marker, sampling) is in `OLENS`, and a read with another contract is a different experiment.
+The oracle lens (Appendix A.9.2 of the workspace paper): a LoRA on the subject model that verbalizes one residual-stream activation. The lens proper (distill and RL checkpoints) writes a list of bullet concepts; the inverter it is distilled from writes the text that would follow the activation. Each checkpoint has a read contract (prompt, transform, layers, marker, sampling), and a read with another contract is a different experiment.
+
+Contracts come from the checkpoint's `olens.json` card where it ships one: `agu18dec/mOre-lenses` has inverter, distill and RL checkpoints for Qwen3.5 0.8B to 9B, Qwen3.6-27B and Gemma-4-31B-it. `OLENS` holds the two checkpoints without a card, Qwen3.6-27B (`agu18dec/olens_and_ar`, the default) and Qwen3-4B (`andyx10/oracle-lens-qwen3-4b`).
 
 ```python
 hf = load_hf_model("Qwen/Qwen3.6-27B")
@@ -146,14 +148,20 @@ with peft.disable_adapter():                          # the subject model's acti
 
 recs = olens_read(peft, tok, cache["blocks.44.hook_resid_post"][0, -1], 44, contract, n=2)   # two records, each with its list of concepts in "bullets"
 recs = olens_readout(cache, layers=[28, 44, 60], pos=[-1, -3], model=peft, tokenizer=tok, contract=contract, input_src=ids)   # one record per (layer, position, sample)
+
+# a card checkpoint: "repo:checkpoint directory", card and adapter at one pinned commit
+hf = load_hf_model("Qwen/Qwen3.5-9B")
+peft, contract = load_olens(hf, "agu18dec/mOre-lenses:qwen3.5-9b/rl/rl.qwen3.5-9b.ddp600.s0", revision=commit)
+peft, inv = load_olens(peft, "agu18dec/mOre-lenses:qwen3.5-9b/inverter/ao.qwen3.5-9b.s0", name="inverter", revision=commit)   # a second adapter on the same base; peft.set_adapter picks which one reads
 ```
 
-- `load_olens`: `load_adapters` under a name plus the checkpoint's contract. Only the adapter files are fetched.
+- `load_olens`: `load_adapters` under a name plus the checkpoint's contract: `contract=` when given, else the `OLENS` entry, else the checkpoint's card, then the adapter the card names. Only the adapter files and the card are fetched.
+- `olens_card`, `card_contract`: a checkpoint's card and the contract built from it. Raises for an AR checkpoint (not a lens) and for any card field or value the module does not implement, so a change of the card format fails instead of being read wrong.
 - `olens_prompt`: the rendered prompt and the marker's slot, found by `single_token_marker` and checked against the contract.
-- `olens_read`: one batched generation for an activation or a stack of them, `n` samples each. Returns a record per sample: `layer`, `i` (the activation), `j` (the sample), `h` (the activation, float32 on the cpu), `text`, `ids`, `stopped` and `bullets`.
-- `olens_readout`: a tab per layer and per position with the token strip, like the cluster readouts (`raw=True` shows the texts instead of the bullets); returns the records with `pos` added.
+- `olens_read`: one batched generation for an activation or a stack of them, `n` samples each. Returns a record per sample: `layer`, `i` (the activation), `j` (the sample), `h` (the activation, float32 on the cpu), `text`, `ids`, `stopped` and `bullets` (None for an inverter).
+- `olens_readout`: a tab per layer and per position with the token strip, like the cluster readouts (`raw=True`, and every inverter, shows the texts instead of the bullets); returns the records with `pos` added.
 
-A checkpoint's "layer L" is the output of block L, which is the Bridge's hook_resid_post, so the readout's `hook` defaults to that where the lens module's readouts default to hook_resid_pre. Samples are deterministic given the batch of activations, `n` and `seed`, not per activation.
+A checkpoint's "layer L" is the output of block L, which is the Bridge's hook_resid_post, so the readout's `hook` defaults to that where the lens module's readouts default to hook_resid_pre. Samples are deterministic given the batch of activations, `n` and `seed`, not per activation. Inverters were trained on reconstructed activations and read them at their own norm, so massive-activation positions (BOS, attention sinks) are off-distribution for them.
 
 ### `nla`
 

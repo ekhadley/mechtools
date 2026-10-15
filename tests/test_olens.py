@@ -1,7 +1,10 @@
+import json
+import shutil
+
 import pytest
 import torch as t
 from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, Gemma4Config, Gemma4ForConditionalGeneration
 
 from conftest import TINY_MODEL, first_pane, load_tokenizer, widget_data
 from mechtools import olens
@@ -10,12 +13,17 @@ from mechtools.models import boot_bridge, load_adapters
 from mechtools.lens import readout_grid
 from mechtools.olens import *
 from mechtools.stats import normed
-from mechtools.tokens import single_token_marker
+from mechtools.tokens import single_token_marker, to_ids
 
 D = 16
 GREEDY = {"do_sample": False, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 3}
 td = lambda s: f"<td class=w><div>{s}</div></td>"  # a readout cell in the wrapping column: its text in a div the frame caps at 100ch
 texts = lambda recs: [r["text"] for r in recs]
+
+# olens.json cards of agu18dec/mOre-lenses, verbatim: an inverter (scaled transform, continuation prompt), an RL lens on Gemma-4, and an AR, which has no read section
+QWEN_INVERTER_CARD = {'repo': 'agu18dec/mOre-lenses', 'subject': 'qwen3.5-0.8b', 'base_model': 'Qwen/Qwen3.5-0.8B', 'role': 'inverter', 'run': 'ao.qwen3.5-0.8b.s0', 'label': 'inverter', 'adapter_subfolder': 'qwen3.5-0.8b/inverter/ao.qwen3.5-0.8b.s0/lora', 'source': 'olens-qwen3.5-0.8b-runs:ao_checkpoints/ao.qwen3.5-0.8b.s0/step6805/lora', 'workspacebench_tag': 'qwen3.5-0.8b.inv.end', 'read': {'transform': 'scaled', 'alpha': 16000.0, 'global_scale': 458.5681356729765, 'inject': 'h -> global_scale * h', 'prompt_kind': 'continuation_raw', 'prompt_template': 'An activation vector from layer {layer} of a language model is enclosed in activation tags: <activation>{char}</activation>. Produce the text that immediately follows this activation.', 'slot_char': '㈜', 'slot_id': 158983, 'layers': [8, 10, 12, 14, 16, 18, 20, 22], 'activation': 'output of decoder block L at one token = hidden_states[L + 1]', 'sampling_of_record': {'temperature': 1.0, 'top_p': 0.95, 'top_k': 64, 'max_new_tokens': 256, 'k': 1}}}
+GEMMA_RL_CARD = {'repo': 'agu18dec/mOre-lenses', 'subject': 'gemma-4-31b-it', 'base_model': 'google/gemma-4-31B-it', 'role': 'rl', 'run': 'rl.gemma4-31b.arwsd.ddp600.s0', 'label': 'RL i600 (fixed)', 'adapter_subfolder': 'gemma-4-31b-it/rl/rl.gemma4-31b.arwsd.ddp600.s0/iter_000600', 'source': 'olens-gemma-4-31b-it-runs:rl_runs/rl.gemma4-31b.arwsd.ddp600.s0/iter_000600', 'workspacebench_tag': 'gemma.gfix.arwsd.rl.i600', 'read': {'transform': 'unit', 'alpha': 16000.0, 'global_scale': None, 'inject': 'h -> alpha * h / |h|', 'prompt_kind': 'concepts_raw', 'prompt_template': "An activation vector from layer {layer} of a language model is enclosed in activation tags: <activation>{char}</activation>. Produce distinct concepts that encode this activation, each as a '- ' bullet on its own line.", 'slot_char': '㈜', 'slot_id': 246566, 'layers': [20, 24, 28, 32, 36, 40, 44, 48, 52, 56], 'activation': 'output of decoder block L at one token = hidden_states[L + 1]', 'sampling_of_record': {'temperature': 1.0, 'top_p': 0.95, 'top_k': 64, 'max_new_tokens': 256, 'k': 1}}}
+AR_CARD = {'repo': 'agu18dec/mOre-lenses', 'subject': 'qwen3.5-0.8b', 'base_model': 'Qwen/Qwen3.5-0.8B', 'role': 'ar', 'run': 'ar.qwen3.5-0.8b.ptag.s0', 'label': 'AR', 'adapter_subfolder': 'qwen3.5-0.8b/ar/ar.qwen3.5-0.8b.ptag.s0/lora', 'source': 'olens-qwen3.5-0.8b-runs:ml_checkpoints/ar.qwen3.5-0.8b.ptag.s0/end/lora', 'workspacebench_tag': None, 'ar': {'layers': [8, 10, 12, 14, 16, 18, 20, 22, 23], 'head_mode': 'prompt_tag', 'tag_template': '[Layer {n:02d}]', 'head_output': 'raw', 'loss_space': 'whiten', 'whitener_prefix': 'whitening_iolens_chat', 'note': "LoRA + linear per-layer heads (heads.pt) predicting the residual at each layer from a text span; the subject's whitener is not included."}}
 
 @pytest.fixture(scope="module")
 def tok():
@@ -29,7 +37,7 @@ def contract(tok):
     render = lambda c: tok.apply_chat_template([{"role": "user", "content": OLENS_PROMPT.format(layer=0, char=c)}], tokenize=True, return_dict=False, add_generation_prompt=True)
     char, cid, ids, slot = single_token_marker(tok, render, "ZQXJ")
     assert (char, tok.decode(ids[slot - 1]), tok.decode(ids[slot + 1])) == ("Z", ">", "</")
-    return {"base": TINY_MODEL, "layers": [0, 1], "alpha": 7.0, "marker": (char, cid, (ids[slot - 1], ids[slot + 1])), "sampling": dict(GREEDY)}
+    return {"base": TINY_MODEL, "layers": [0, 1], "prompt_kind": "concepts_raw", "transform": "unit", "alpha": 7.0, "global_scale": None, "marker": (char, cid, (ids[slot - 1], ids[slot + 1])), "sampling": dict(GREEDY)}
 
 @pytest.fixture(scope="module")
 def adapter_dir(tmp_path_factory, tok):
@@ -70,19 +78,63 @@ def fake_generate(monkeypatch):
 def test_contract_table():
     assert list(OLENS) == ["agu18dec/olens_and_ar:olens_s3d_rl600", "andyx10/oracle-lens-qwen3-4b"]
     for c in OLENS.values():
-        assert set(c) == {"base", "layers", "alpha", "marker", "sampling"} and set(c["sampling"]) == {"do_sample", "temperature", "top_p", "top_k", "max_new_tokens"} and c["alpha"] == 16000.0 and c["sampling"]["do_sample"] is True
+        assert set(c) == {"base", "layers", "prompt_kind", "transform", "alpha", "global_scale", "marker", "sampling"} and set(c["sampling"]) == {"do_sample", "temperature", "top_p", "top_k", "max_new_tokens"} and c["alpha"] == 16000.0 and c["sampling"]["do_sample"] is True
+        assert (c["prompt_kind"], c["transform"], c["global_scale"]) == ("concepts_raw", "unit", None)
     agu, andy = OLENS.values()
     assert agu["base"] == "Qwen/Qwen3.6-27B" and agu["layers"] == list(range(20, 61, 4)) and agu["marker"] == ("㈜", 158983, (29, 510)) and agu["sampling"] == {"do_sample": True, "temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_new_tokens": 256}
     assert andy["base"] == "Qwen/Qwen3-4B" and andy["layers"] == list(range(12, 35, 2)) and andy["marker"] == ("㈎", 149705, (29, 522)) and andy["sampling"] == {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 128}
     assert OLENS_PROMPT.format(layer=44, char="㈜") == "An activation vector from layer 44 of a language model is enclosed in activation tags: <activation>㈜</activation>. Produce distinct concepts that encode this activation, each as a '- ' bullet on its own line."
+    assert OLENS_PROMPT is PROMPTS["concepts_raw"] and PROMPTS["continuation_raw"].format(layer=20, char="㈜") == "An activation vector from layer 20 of a language model is enclosed in activation tags: <activation>㈜</activation>. Produce the text that immediately follows this activation."
 
 def test_parse_bullets():
     assert parse_bullets("Concepts:\n- cats\n\n  - dogs and  \n-not a bullet\n- \n-\n--dash\nplain line\n- last") == ["cats", "dogs and", "last"]
     assert parse_bullets("") == [] and parse_bullets("- one") == ["one"] and parse_bullets("- a - b\n") == ["a - b"]
 
-def test_load_olens_unknown_spec_raises_before_loading():
-    with pytest.raises(KeyError, match=r"'nope/nope'.*agu18dec/olens_and_ar:olens_s3d_rl600.*andyx10/oracle-lens-qwen3-4b.*contract="):
-        load_olens(object(), "nope/nope")  # object() has no modules(), so load_adapters would have raised AttributeError had it been called
+def test_card_contract():
+    sampling = {"do_sample": True, "temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_new_tokens": 256}
+    assert card_contract(QWEN_INVERTER_CARD) == {"base": "Qwen/Qwen3.5-0.8B", "layers": list(range(8, 23, 2)), "prompt_kind": "continuation_raw", "transform": "scaled", "alpha": 16000.0, "global_scale": 458.5681356729765, "marker": ("㈜", 158983, None), "sampling": sampling}
+    assert card_contract(GEMMA_RL_CARD) == {"base": "google/gemma-4-31B-it", "layers": list(range(20, 57, 4)), "prompt_kind": "concepts_raw", "transform": "unit", "alpha": 16000.0, "global_scale": None, "marker": ("㈜", 246566, None), "sampling": sampling}
+    assert QWEN_INVERTER_CARD["read"]["sampling_of_record"]["k"] == 1  # the card is not mutated
+    with pytest.raises(ValueError, match=r"'ar.qwen3.5-0.8b.ptag.s0' \(ar\) has no read contract"):
+        card_contract(AR_CARD)
+    edit = lambda **kw: QWEN_INVERTER_CARD | {"read": QWEN_INVERTER_CARD["read"] | kw}
+    with pytest.raises(ValueError, match=r"differ from the known ones by \['clip_mult'\]"):
+        card_contract(edit(clip_mult=4.0))
+    for kw, bad in [({"inject": "h -> clip(global_scale * h)"}, "transform"), ({"transform": "wht_unit"}, "transform"), ({"transform": "unit", "inject": "h -> alpha * h / |h|"}, "transform"), ({"global_scale": None}, "transform"), ({"prompt_template": OLENS_PROMPT}, "prompt"), ({"prompt_kind": "concepts_v2"}, "prompt"), ({"activation": "input of decoder block L"}, "activation"), ({"sampling_of_record": {"temperature": 1.0, "top_p": 0.95, "top_k": 64, "max_new_tokens": 256}}, "sampling")]:
+        with pytest.raises(ValueError, match=rf"unknown \['{bad}'\] in the card's read contract"):
+            card_contract(edit(**kw))
+
+def test_load_olens_card_from_hub(tmp_path, monkeypatch):
+    """A spec with no table entry and no contract= is a checkpoint directory: its card is fetched first, then the adapter at the card's adapter_subfolder of the same repo, both at the given revision."""
+    calls = []
+    (tmp_path / "olens.json").write_text(json.dumps(QWEN_INVERTER_CARD))
+    monkeypatch.setattr(olens, "hf_hub_download", lambda *a, **kw: calls.append((a, kw)) or str(tmp_path / "olens.json"))
+    monkeypatch.setattr(olens, "load_adapters", lambda model, adapters, **kw: calls.append((model, adapters, kw)) or "peft")
+    spec = "agu18dec/mOre-lenses:qwen3.5-0.8b/inverter/ao.qwen3.5-0.8b.s0"
+    peft, c = load_olens("hf", spec, revision="abc123")
+    assert calls == [(("agu18dec/mOre-lenses", "olens.json"), {"subfolder": "qwen3.5-0.8b/inverter/ao.qwen3.5-0.8b.s0", "revision": "abc123"}), ("hf", {"olens": "agu18dec/mOre-lenses:qwen3.5-0.8b/inverter/ao.qwen3.5-0.8b.s0/lora"}, {"revision": "abc123"})]
+    assert peft == "peft" and c == card_contract(QWEN_INVERTER_CARD) | {"adapter": "olens", "spec": spec}
+    monkeypatch.setattr(olens, "hf_hub_download", lambda *a, **kw: str(tmp_path / "olens.json").replace("olens.json", "ar.json"))
+    (tmp_path / "ar.json").write_text(json.dumps(AR_CARD))
+    with pytest.raises(ValueError, match="has no read contract"):  # the card is read before any adapter is loaded
+        load_olens("hf", "agu18dec/mOre-lenses:qwen3.5-0.8b/ar/ar.qwen3.5-0.8b.ptag.s0")
+    assert len(calls) == 2
+
+def test_load_olens_card_local(tmp_path, adapter_dir, contract, tok):
+    """A local copy of a card repo, "root:dir": the card at root/dir/olens.json, the adapter at root/<adapter_subfolder>. The tiny model's card is the Gemma RL card with the tiny model's marker, layers and alpha."""
+    char, cid, _ = contract["marker"]
+    card = GEMMA_RL_CARD | {"base_model": TINY_MODEL, "adapter_subfolder": "tiny/rl/run/iter_000600", "read": GEMMA_RL_CARD["read"] | {"alpha": 7.0, "slot_char": char, "slot_id": cid, "layers": [0, 1]}}
+    shutil.copytree(adapter_dir, tmp_path / "tiny/rl/run/iter_000600")
+    (tmp_path / "tiny/rl/run/olens.json").write_text(json.dumps(card))
+    spec = f"{tmp_path}:tiny/rl/run"
+    peft, c = load_olens(AutoModelForCausalLM.from_pretrained(TINY_MODEL, dtype=t.float32), spec)
+    assert c == card_contract(card) | {"adapter": "olens", "spec": spec} and peft.active_adapters == ["olens"] and peft.peft_config["olens"].r == 4
+    ids, slot = olens_prompt(tok, 1, c, chars="ZQXJ")  # a card names no neighbors: the scan's character and id are checked
+    assert ids[slot] == cid
+    with pytest.raises(ValueError, match=rf"contract's marker is 'Z' \(id {cid + 1}\) between any ids"):
+        olens_prompt(tok, 1, c | {"marker": (char, cid + 1, None)}, chars="ZQXJ")
+    with pytest.raises(FileNotFoundError, match="olens.json"):  # no card and no table entry: raises before any loading
+        load_olens(object(), f"{tmp_path}:tiny/rl")
 
 def test_load_olens_table_contract(monkeypatch):
     calls = []
@@ -197,6 +249,19 @@ def test_olens_read_end_to_end(lens, tok):
     one = olens_read(peft, tok, h[0], 0, c, chars="ZQXJ")
     assert len(one) == 1 and isinstance(one[0]["bullets"], list) and all(isinstance(s, str) for s in one[0]["bullets"])
 
+def test_olens_read_inverter(lens, tok, fake_generate, shown):
+    """An inverter contract: the continuation prompt, global_scale * h written (the norm kept), no bullets, and a readout of its text a line per row."""
+    peft, c, _ = lens
+    inv = c | {"prompt_kind": "continuation_raw", "transform": "scaled", "global_scale": 3.0}
+    out = olens_read(peft, tok, t.randn(2, D), 1, inv, n=2, chars="ZQXJ")
+    ids, slot = olens_prompt(tok, 1, inv, chars="ZQXJ")
+    assert fake_generate["ids"] == ids and fake_generate["positions"] == [slot] and tok.decode(ids) == "<s>[INST] " + PROMPTS["continuation_raw"].format(layer=1, char="Z") + " [/INST]"
+    v = t.randn(4, 1, D)
+    assert t.equal(fake_generate["write"](t.randn(4, 1, D), v), 3.0 * v)
+    assert [(r["i"], r["j"], r["bullets"]) for r in out] == [(i, j, None) for i in range(2) for j in range(2)] and out[0]["text"] == "- 0a\n- 0b\nnoise"
+    recs = olens_readout({"blocks.1.hook_resid_post": t.randn(1, 4, D)}, [1], -1, peft, tok, inv, chars="ZQXJ")
+    assert recs[0]["bullets"] is None and td("- 0a") in shown[-1] and td("noise") in shown[-1] and shown[-1].count("<tr") == 4
+
 def test_olens_readout(lens, tok, fake_generate, shown, monkeypatch):
     peft, c, _ = lens
     seen, vecs = fake_generate, fake_generate["calls"]
@@ -265,3 +330,64 @@ def test_checkpoint_contracts(name, spec, layer, bad):
     other = next(s for s in OLENS if s != spec)
     with pytest.raises(ValueError, match="contract's marker"):
         olens_prompt(tok, OLENS[other]["layers"][0], OLENS[other])
+
+@pytest.mark.hf
+@pytest.mark.parametrize("name, card, neighbors, template", [
+    ("Qwen/Qwen3.5-0.8B", QWEN_INVERTER_CARD, (29, 510), "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+    ("google/gemma-4-31B-it", GEMMA_RL_CARD, (236813, 954), "<bos><|turn>user\n{}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"),
+])
+def test_card_markers(name, card, neighbors, template):
+    """On the subject's tokenizer the marker scan lands on the card's character and id, between '>' and '</' (pinned here, since cards do not name the neighbors), at every layer and with both prompts, in the chat template's render with thinking off."""
+    tok = load_tokenizer(name)
+    c = card_contract(card)
+    for kind, prompt in PROMPTS.items():
+        for layer in c["layers"]:
+            ids, slot = olens_prompt(tok, layer, c | {"prompt_kind": kind})
+            assert ids[slot] == c["marker"][1] and (ids[slot - 1], ids[slot + 1]) == neighbors and ids.count(ids[slot]) == 1
+        assert tok.decode(ids) == template.format(prompt.format(layer=layer, char="㈜"))
+    assert tok.decode(list(neighbors)) == "></"
+
+@pytest.fixture(scope="module")
+def tiny_gemma4(tmp_path_factory):
+    """A random 2-block Gemma4ForConditionalGeneration (the 31B's class: d 16, a 1-block vision tower, the real 262k vocabulary, no per-layer inputs) saved with the gemma-4-31B-it tokenizer, which boot_bridge loads from the model's path."""
+    tok = load_tokenizer("google/gemma-4-31B-it")
+    text = dict(vocab_size=262144, hidden_size=16, intermediate_size=32, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1, head_dim=8, global_head_dim=8, num_global_key_value_heads=1, attention_k_eq_v=True, sliding_window=8, layer_types=["sliding_attention", "full_attention"], hidden_size_per_layer_input=0, max_position_embeddings=128, rope_parameters={"full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1e6, "rope_type": "proportional"}, "sliding_attention": {"rope_theta": 1e4, "rope_type": "default"}})
+    vision = dict(hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2, head_dim=8, global_head_dim=8)
+    t.manual_seed(0)
+    path = tmp_path_factory.mktemp("gemma4")
+    Gemma4ForConditionalGeneration(Gemma4Config(text_config=text, vision_config=vision, eos_token_id=[1, 106])).save_pretrained(path)
+    tok.save_pretrained(path)
+    return str(path), tok
+
+@pytest.mark.hf
+def test_gemma4_card_lens(tiny_gemma4, tmp_path):
+    """A card lens on Gemma-4's multimodal class: a LoRA with the released adapters' language_model keys loads through the card, block L's output in the Bridge is hidden_states[L + 1], and the write lands in block 0's input as alpha * unit(h): it replaces the embedding module's output, which already holds the sqrt(d) scale, and is not scaled again."""
+    path, tok = tiny_gemma4
+    t.manual_seed(0)
+    pm = get_peft_model(Gemma4ForConditionalGeneration.from_pretrained(path, dtype=t.float32), LoraConfig(r=4, lora_alpha=8, target_modules=r".*language_model.*\.(q_proj|v_proj)"))  # the vision tower's projections are not nn.Linear, and the released adapters list language-model modules only
+    for name, p in pm.named_parameters():
+        if "lora_B" in name:
+            p.data.normal_()
+    pm.save_pretrained(tmp_path / "gemma/rl/run/iter_000600", save_embedding_layers=False)
+    card = GEMMA_RL_CARD | {"base_model": path, "adapter_subfolder": "gemma/rl/run/iter_000600", "read": GEMMA_RL_CARD["read"] | {"alpha": 7.0, "layers": [0, 1]}}
+    (tmp_path / "gemma/rl/run/olens.json").write_text(json.dumps(card))
+    hf = Gemma4ForConditionalGeneration.from_pretrained(path, dtype=t.float32)
+    peft, c = load_olens(hf, f"{tmp_path}:gemma/rl/run")
+    assert next(k for k in peft.state_dict() if "lora_A" in k).startswith("base_model.model.model.language_model.layers.0.")
+    bridge = boot_bridge(hf)
+    ids = to_ids([{"role": "user", "content": "What is the capital of France?"}], tok, add_generation_prompt=True, enable_thinking=False)
+    with peft.disable_adapter():
+        _, cache = bridge.run_with_cache(t.tensor([ids]))
+        hs = peft(t.tensor([ids]), output_hidden_states=True).hidden_states
+    assert t.allclose(cache["blocks.0.hook_resid_post"], hs[1], atol=1e-5)
+    seen = []
+    handle = decoder_layers(peft)[0].register_forward_pre_hook(lambda m, args, kwargs: seen.append(args[0].clone()), with_kwargs=True)
+    h = cache["blocks.0.hook_resid_post"][0, -1]
+    out = olens_read(peft, tok, h, 0, c, n=2, max_new_tokens=2)
+    handle.remove()
+    pids, slot = olens_prompt(tok, 0, c)
+    emb = peft.get_input_embeddings()
+    x = seen[0]
+    assert x.shape == (2, len(pids), 16) and t.allclose(x[:, slot], 7.0 * normed(h).expand(2, -1), atol=1e-5)
+    assert t.allclose(x[0, slot - 1], emb.weight[pids[slot - 1]] * 4.0, atol=1e-5)  # every other row is the embedding times sqrt(16)
+    assert len(out) == 2 and all(isinstance(r["bullets"], list) and len(r["ids"]) <= 2 for r in out)
